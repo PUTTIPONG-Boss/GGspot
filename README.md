@@ -4,6 +4,8 @@ A tiny, terminal-style Spotify player for Windows. It's for listening and nothin
 
 Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/librespot-org/librespot). **Playback needs Spotify Premium.**
 
+![GGspot showing liked songs, the playlist sidebar and the player bar](assets/screenshot.png)
+
 ## Why it's fast
 
 - **Instant start.** The library is cached on disk, so it shows up on the first frame (about 100 ms). It refreshes in the background.
