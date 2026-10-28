@@ -1,0 +1,29 @@
+[package]
+name = "ggspot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "7.0.0"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit", "clipboard"] }
+librespot-core = { version = "0.8.0", default-features = false, features = ["native-tls"] }
+librespot-metadata = "0.8.0"
+librespot-oauth = { version = "0.8.0", default-features = false, features = ["native-tls"] }
+librespot-playback = { version = "0.8.0", default-features = false, features = ["rodio-backend"] }
+librespot-protocol = "0.8.0"
+protobuf = "3.7"
+protobuf-json-mapping = "3.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
+
+[build-dependencies]
+winresource = "0.1.34"
+
