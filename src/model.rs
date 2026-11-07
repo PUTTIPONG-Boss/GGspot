@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::queue::Repeat;
+
 pub const LIKED: &str = "liked";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -37,6 +39,12 @@ pub struct Library {
 pub struct Config {
     pub volume: Option<u16>,
     pub last_view: Option<String>,
+    #[serde(default)]
+    pub repeat: Repeat,
+    #[serde(default)]
+    pub shuffle: bool,
+    /// On unless turned off, like Spotify.
+    pub autoplay: Option<bool>,
 }
 
 pub fn data_dir() -> PathBuf {

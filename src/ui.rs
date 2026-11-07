@@ -12,10 +12,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{Cmd, Ev};
 use crate::model::*;
+use crate::queue::Repeat;
 
 const ROW_H: f32 = 24.0;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const ARTIST_VIEW: &str = "artist";
+const QUEUE_VIEW: &str = "queue";
 
 // Terminal palette.
 const BG: Color32 = Color32::from_rgb(10, 13, 10);
@@ -198,6 +200,15 @@ fn text_button(ui: &mut egui::Ui, label: &str) -> bool {
     r.clicked()
 }
 
+/// Accent when on, dim when off.
+fn mode_button(ui: &mut egui::Ui, label: &str, on: bool, tip: &str) -> bool {
+    let r = ui.add(egui::Button::new(RichText::new(label).color(if on { ACCENT } else { DIM })).frame(false)).on_hover_text(tip);
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    r.clicked()
+}
+
 struct ArtistPage {
     uri: String,
     name: String,
@@ -216,6 +227,12 @@ pub struct App {
     remote: (String, Vec<Track>),
     artist: Option<ArtistPage>,
     now: Option<Track>,
+    queue: Vec<Track>,
+    queue_idx: usize,
+    queue_auto_from: Option<usize>,
+    repeat: Repeat,
+    shuffle: bool,
+    autoplay: bool,
     playing: bool,
     pos: (u32, Instant),
     seek: Option<f32>,
@@ -244,6 +261,12 @@ impl App {
             remote: (String::new(), Vec::new()),
             artist: None,
             now: None,
+            queue: Vec::new(),
+            queue_idx: 0,
+            queue_auto_from: None,
+            repeat: cfg.repeat,
+            shuffle: cfg.shuffle,
+            autoplay: cfg.autoplay.unwrap_or(true),
             playing: false,
             pos: (0, Instant::now()),
             seek: None,
@@ -268,6 +291,9 @@ impl App {
         self.view = id.clone();
         self.selected = None;
         self.query.clear();
+        if id == QUEUE_VIEW {
+            return;
+        }
         self.send(Cmd::View(id.clone()));
         self.send(Cmd::Open(id));
     }
@@ -302,8 +328,19 @@ impl App {
     fn current_tracks(&self) -> &[Track] {
         if self.view == ARTIST_VIEW {
             self.artist.as_ref().map_or(&[], |a| a.tracks.as_slice())
+        } else if self.view == QUEUE_VIEW {
+            self.queue.get(self.queue_idx..).unwrap_or(&[])
         } else {
             self.lib.tracks(&self.view)
+        }
+    }
+
+    /// Play row `i` of the main list; in the queue view that moves within the queue.
+    fn play_main(&self, i: usize) {
+        if self.view == QUEUE_VIEW {
+            self.send(Cmd::Jump(self.queue_idx + i));
+        } else {
+            self.send(Cmd::Play(self.current_tracks().to_vec(), i));
         }
     }
 
@@ -362,6 +399,17 @@ impl App {
                 Ev::State { playing, pos_ms } => {
                     self.playing = playing;
                     self.pos = (pos_ms, Instant::now());
+                }
+                Ev::Queue { tracks, idx, auto_from } => {
+                    self.fonts.scan(ctx, track_texts(&tracks), false);
+                    self.queue = tracks;
+                    self.queue_idx = idx;
+                    self.queue_auto_from = auto_from;
+                }
+                Ev::Modes { repeat, shuffle, autoplay } => {
+                    self.repeat = repeat;
+                    self.shuffle = shuffle;
+                    self.autoplay = autoplay;
                 }
             }
         }
@@ -470,7 +518,11 @@ impl App {
             }
         });
         if let Some(i) = play {
-            self.send(Cmd::Play(tracks.to_vec(), i));
+            if id == "main" {
+                self.play_main(i);
+            } else {
+                self.send(Cmd::Play(tracks.to_vec(), i));
+            }
         }
         if let Some(t) = artist {
             self.open_artist(&t);
@@ -489,6 +541,21 @@ impl App {
             }
             if text_button(ui, "[>|]") {
                 self.send(Cmd::Next);
+            }
+            ui.add_space(6.0);
+            if mode_button(ui, "[shuf]", self.shuffle, "shuffle (ctrl+s)") {
+                self.send(Cmd::ToggleShuffle);
+            }
+            let repeat = match self.repeat {
+                Repeat::Off => "[rpt:off]",
+                Repeat::All => "[rpt:all]",
+                Repeat::One => "[rpt:one]",
+            };
+            if mode_button(ui, repeat, self.repeat != Repeat::Off, "repeat: off, all, one (ctrl+r)") {
+                self.send(Cmd::CycleRepeat);
+            }
+            if mode_button(ui, "[auto]", self.autoplay, "autoplay: keep playing similar songs when the queue ends") {
+                self.send(Cmd::ToggleAutoplay);
             }
             ui.add_space(10.0);
             match &self.now {
@@ -579,6 +646,12 @@ impl eframe::App for App {
             if i.consume_key(Modifiers::COMMAND, Key::ArrowLeft) {
                 let _ = self.cmd.send(Cmd::Prev);
             }
+            if i.consume_key(Modifiers::COMMAND, Key::S) {
+                let _ = self.cmd.send(Cmd::ToggleShuffle);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::R) {
+                let _ = self.cmd.send(Cmd::CycleRepeat);
+            }
             if !typing && i.consume_key(Modifiers::NONE, Key::Space) {
                 let _ = self.cmd.send(Cmd::Toggle);
             }
@@ -599,7 +672,7 @@ impl eframe::App for App {
                 self.selected = Some(self.selected.map_or(0, |s| s.saturating_sub(1)));
             }
             if enter && let Some(s) = self.selected {
-                self.send(Cmd::Play(self.current_tracks().to_vec(), s));
+                self.play_main(s);
             }
         }
 
@@ -654,6 +727,7 @@ impl eframe::App for App {
                             }
                         };
                         entry(ui, LIKED, "liked songs");
+                        entry(ui, QUEUE_VIEW, "queue");
                         ui.add_space(6.0);
                         ui.label(RichText::new("## playlists").color(DIM));
                         for p in &self.lib.playlists {
@@ -693,6 +767,12 @@ impl eframe::App for App {
                         }
                         let name = self.artist.as_ref().map(|a| a.name.clone()).unwrap_or_default();
                         ui.label(RichText::new(format!("# artist: {name}")).heading().color(ACCENT));
+                    } else if self.view == QUEUE_VIEW {
+                        ui.label(RichText::new("# queue").heading().color(ACCENT));
+                        let auto = self.queue_auto_from.map_or(0, |a| self.queue.len() - a.max(self.queue_idx));
+                        if auto > 0 {
+                            ui.label(RichText::new(format!("{auto} from autoplay")).color(DIM));
+                        }
                     } else {
                         let title = if self.view == LIKED {
                             "liked songs".to_string()

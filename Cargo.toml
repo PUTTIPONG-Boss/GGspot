@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 dirs = "7.0.0"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit", "clipboard"] }
+fastrand = "2.5.0"
 librespot-core = { version = "0.8.0", default-features = false, features = ["native-tls"] }
 librespot-metadata = "0.8.0"
 librespot-oauth = { version = "0.8.0", default-features = false, features = ["native-tls"] }

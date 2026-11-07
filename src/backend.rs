@@ -23,6 +23,7 @@ use librespot_playback::{
     player::{Player, PlayerEvent},
 };
 use librespot_protocol::{
+    autoplay_context_request::AutoplayContextRequest,
     context_page::ContextPage,
     extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery},
     extension_kind::ExtensionKind,
@@ -33,6 +34,7 @@ use protobuf::{EnumOrUnknown, Message};
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::model::*;
+use crate::queue::{Queue, Repeat};
 
 /// Spotify's desktop client ID: its login page is the regular Spotify one.
 const SPOTIFY_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
@@ -57,6 +59,10 @@ pub enum Cmd {
     Toggle,
     Next,
     Prev,
+    Jump(usize),
+    CycleRepeat,
+    ToggleShuffle,
+    ToggleAutoplay,
     Seek(u32),
     Volume(u16),
     View(String),
@@ -74,6 +80,8 @@ pub enum Ev {
     Artist(String, Vec<Track>),
     NowPlaying(Track),
     State { playing: bool, pos_ms: u32 },
+    Queue { tracks: Vec<Track>, idx: usize, auto_from: Option<usize> },
+    Modes { repeat: Repeat, shuffle: bool, autoplay: bool },
 }
 
 #[derive(Clone)]
@@ -358,6 +366,29 @@ async fn artist(session: &Session, uri: &str, known: &HashMap<String, Track>) ->
     resolve(session, &uris, known).await
 }
 
+/// Songs Spotify would keep playing after `seed`, avoiding `recent`.
+async fn fetch_autoplay(
+    session: &Session,
+    seed: String,
+    recent: Vec<String>,
+    known: &HashMap<String, Track>,
+) -> Res<Vec<Track>> {
+    let req = AutoplayContextRequest {
+        context_uri: Some(seed),
+        recent_track_uri: recent,
+        ..Default::default()
+    };
+    let ctx = session.spclient().get_autoplay_context(&req).await.map_err(err)?;
+    let uris: Vec<String> = ctx
+        .pages
+        .iter()
+        .flat_map(|p| p.tracks.iter())
+        .map(|t| t.uri().to_string())
+        .filter(|u| u.starts_with("spotify:track:"))
+        .collect();
+    resolve(session, &uris, known).await
+}
+
 // ------------------------------------------------------------- Main loop
 
 struct Shared {
@@ -460,6 +491,205 @@ async fn sync_library(shared: Arc<Shared>) {
     }
 }
 
+/// What is playing, what comes next, and the autoplay top-up.
+struct Playback {
+    shared: Arc<Shared>,
+    out: Out,
+    queue: Queue,
+    player: Option<(Arc<Player>, Arc<dyn Mixer>)>,
+    autoplay: bool,
+    auto_tx: mpsc::UnboundedSender<(u64, Res<Vec<Track>>)>,
+    /// Bumped when the queue is replaced, so late autoplay answers are ignored.
+    auto_gen: u64,
+    auto_busy: bool,
+    auto_exhausted: bool,
+    /// The queue ran out; play the next song as soon as autoplay answers.
+    waiting_for_auto: bool,
+    ended: bool,
+    playing: bool,
+    pos: (u32, Instant),
+    /// Unavailable songs in a row; stops an endless skip loop.
+    failures: u32,
+    /// Asked to play before the player exists.
+    pending: bool,
+    reconnect: bool,
+}
+
+impl Playback {
+    fn publish_queue(&self) {
+        self.out.send(Ev::Queue {
+            tracks: self.queue.tracks().to_vec(),
+            idx: self.queue.idx(),
+            auto_from: self.queue.auto_from(),
+        });
+    }
+
+    fn publish_modes(&self) {
+        self.out.send(Ev::Modes {
+            repeat: self.queue.repeat,
+            shuffle: self.queue.shuffle,
+            autoplay: self.autoplay,
+        });
+    }
+
+    fn start_current(&mut self) {
+        // Session dropped (sleep, network change): reconnect, then play.
+        if self.shared.session.borrow().as_ref().is_some_and(|s| s.is_invalid()) {
+            self.player = None;
+            self.reconnect = true;
+        }
+        self.ended = false;
+        self.waiting_for_auto = false;
+        let Some(t) = self.queue.current().cloned() else { return };
+        match (&self.player, SpotifyUri::from_uri(&t.uri)) {
+            (Some((p, _)), Ok(uri)) => p.load(uri, true, 0),
+            _ => {
+                self.pending = true;
+                self.out.status("connecting... will play when ready");
+            }
+        }
+        self.pos = (0, Instant::now());
+        self.out.send(Ev::NowPlaying(t));
+        self.publish_queue();
+        self.auto_exhausted = false;
+        self.maybe_autoplay();
+    }
+
+    fn stop_at_end(&mut self) {
+        self.playing = false;
+        self.ended = true;
+        self.waiting_for_auto = false;
+        self.pos = (0, Instant::now());
+        self.out.send(Ev::State { playing: false, pos_ms: 0 });
+    }
+
+    fn maybe_autoplay(&mut self) {
+        if !self.autoplay || self.auto_busy || self.auto_exhausted || !self.queue.wants_autoplay() {
+            return;
+        }
+        let Some((seed, recent)) = self.queue.autoplay_seed() else { return };
+        self.auto_busy = true;
+        let (shared, tx, generation) = (self.shared.clone(), self.auto_tx.clone(), self.auto_gen);
+        tokio::spawn(async move {
+            let session = shared.session().await;
+            let res = fetch_autoplay(&session, seed, recent, &shared.known_tracks()).await;
+            let _ = tx.send((generation, res));
+        });
+    }
+
+    fn on_autoplay(&mut self, generation: u64, res: Res<Vec<Track>>) {
+        if generation != self.auto_gen {
+            return;
+        }
+        self.auto_busy = false;
+        match res {
+            Ok(tracks) => {
+                let added = self.queue.extend_autoplay(tracks);
+                self.auto_exhausted = added == 0;
+                self.publish_queue();
+            }
+            Err(e) => {
+                // No retry until the next song starts.
+                self.auto_exhausted = true;
+                self.out.status(format!("autoplay failed: {e}"));
+            }
+        }
+        if self.waiting_for_auto {
+            self.waiting_for_auto = false;
+            if self.queue.skip_forward() {
+                self.start_current();
+            } else {
+                self.stop_at_end();
+            }
+        } else {
+            self.maybe_autoplay();
+        }
+    }
+
+    /// Move past the current song; autoplay fills in when the queue has run out.
+    fn advance(&mut self, moved: bool, at_end_of_track: bool) {
+        if moved {
+            self.start_current();
+            return;
+        }
+        self.maybe_autoplay();
+        if self.auto_busy {
+            self.waiting_for_auto = true;
+        } else if at_end_of_track {
+            self.stop_at_end();
+        }
+    }
+
+    fn on_player_event(&mut self, ev: PlayerEvent) {
+        match ev {
+            PlayerEvent::Playing { position_ms, .. } => {
+                self.failures = 0;
+                self.playing = true;
+                self.pos = (position_ms, Instant::now());
+                self.out.send(Ev::State { playing: true, pos_ms: position_ms });
+            }
+            PlayerEvent::Paused { position_ms, .. } => {
+                self.playing = false;
+                self.pos = (position_ms, Instant::now());
+                self.out.send(Ev::State { playing: false, pos_ms: position_ms });
+            }
+            PlayerEvent::TimeToPreloadNextTrack { .. } => {
+                if let (Some((p, _)), Some(t)) = (&self.player, self.queue.preload_target())
+                    && let Ok(uri) = SpotifyUri::from_uri(&t.uri)
+                {
+                    p.preload(uri);
+                }
+            }
+            PlayerEvent::EndOfTrack { .. } => {
+                let moved = self.queue.advance_on_end();
+                self.advance(moved, true);
+            }
+            PlayerEvent::Unavailable { .. } => {
+                self.failures += 1;
+                if self.failures >= 5 {
+                    self.out.status("too many unavailable songs in a row");
+                    self.stop_at_end();
+                } else {
+                    let moved = self.queue.skip_forward();
+                    self.advance(moved, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_queue(&mut self, tracks: Vec<Track>, start: usize) {
+        self.auto_gen += 1;
+        self.auto_busy = false;
+        self.auto_exhausted = false;
+        self.queue.set(tracks, start);
+        self.start_current();
+    }
+
+    fn next(&mut self) {
+        let moved = self.queue.skip_forward();
+        self.advance(moved, false);
+    }
+
+    fn prev(&mut self) {
+        let now = if self.playing { self.pos.0 + self.pos.1.elapsed().as_millis() as u32 } else { self.pos.0 };
+        if now <= 3000 && self.queue.skip_back() {
+            self.start_current();
+        } else if let Some((p, _)) = &self.player {
+            p.seek(0);
+        }
+    }
+
+    fn toggle(&mut self) {
+        if self.ended {
+            self.queue.restart();
+            self.start_current();
+        } else if let Some((p, _)) = &self.player {
+            if self.playing { p.pause() } else { p.play() }
+        }
+    }
+}
+
 async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
     let mut cfg = Config::load();
     let (session_tx, session_rx) = watch::channel(None);
@@ -521,63 +751,47 @@ async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
         start_session(false, true);
     }
 
-    let mut player: Option<(Arc<Player>, Arc<dyn Mixer>)> = None;
-    let mut events: Option<mpsc::UnboundedReceiver<PlayerEvent>> = None;
-    let mut queue: Vec<Track> = Vec::new();
-    let mut idx = 0usize;
-    let mut playing = false;
-    let mut pos = (0u32, Instant::now());
-    let mut pending: Option<(Vec<Track>, usize)> = None;
-    let mut search_task: Option<tokio::task::JoinHandle<()>> = None;
-
-    let load = |p: &Player, t: &Track| {
-        if let Ok(uri) = SpotifyUri::from_uri(&t.uri) {
-            p.load(uri, true, 0);
-        }
+    let (auto_tx, mut auto_rx) = mpsc::unbounded_channel();
+    let mut queue = Queue::default();
+    queue.repeat = cfg.repeat;
+    queue.shuffle = cfg.shuffle;
+    let mut pb = Playback {
+        shared: shared.clone(),
+        out: out.clone(),
+        queue,
+        player: None,
+        autoplay: cfg.autoplay.unwrap_or(true),
+        auto_tx,
+        auto_gen: 0,
+        auto_busy: false,
+        auto_exhausted: false,
+        waiting_for_auto: false,
+        ended: false,
+        playing: false,
+        pos: (0, Instant::now()),
+        failures: 0,
+        pending: false,
+        reconnect: false,
     };
+    pb.publish_modes();
+    let mut events: Option<mpsc::UnboundedReceiver<PlayerEvent>> = None;
+    let mut search_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         tokio::select! {
             Some(pv) = player_rx.recv() => {
                 events = Some(pv.0.get_player_event_channel());
-                player = Some(pv);
-                if let Some((q, i)) = pending.take() {
-                    queue = q; idx = i;
-                    load(&player.as_ref().unwrap().0, &queue[idx]);
-                    out.send(Ev::NowPlaying(queue[idx].clone()));
+                pb.player = Some(pv);
+                pb.reconnect = false;
+                if std::mem::take(&mut pb.pending) {
+                    pb.out.status("");
+                    pb.start_current();
                 }
             }
             Some(ev) = async { match events.as_mut() { Some(e) => e.recv().await, None => std::future::pending().await } } => {
-                let p = &player.as_ref().unwrap().0;
-                match ev {
-                    PlayerEvent::Playing { position_ms, .. } => {
-                        playing = true; pos = (position_ms, Instant::now());
-                        out.send(Ev::State { playing, pos_ms: position_ms });
-                    }
-                    PlayerEvent::Paused { position_ms, .. } => {
-                        playing = false; pos = (position_ms, Instant::now());
-                        out.send(Ev::State { playing, pos_ms: position_ms });
-                    }
-                    PlayerEvent::TimeToPreloadNextTrack { .. } => {
-                        if let Some(t) = queue.get(idx + 1)
-                            && let Ok(uri) = SpotifyUri::from_uri(&t.uri)
-                        {
-                            p.preload(uri);
-                        }
-                    }
-                    PlayerEvent::EndOfTrack { .. } | PlayerEvent::Unavailable { .. } => {
-                        if idx + 1 < queue.len() {
-                            idx += 1;
-                            load(p, &queue[idx]);
-                            out.send(Ev::NowPlaying(queue[idx].clone()));
-                        } else {
-                            playing = false;
-                            out.send(Ev::State { playing, pos_ms: 0 });
-                        }
-                    }
-                    _ => {}
-                }
+                pb.on_player_event(ev);
             }
+            Some((generation, res)) = auto_rx.recv() => pb.on_autoplay(generation, res),
             Some(cmd) = cmds.recv() => match cmd {
                 Cmd::SignIn => start_session(true, true),
                 Cmd::Open(id) => {
@@ -608,44 +822,48 @@ async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
                         }
                     });
                 }
-                Cmd::Play(q, i) => {
-                    if q.is_empty() { continue; }
-                    // Session dropped (sleep, network change): reconnect, then play.
-                    let dead = shared.session.borrow().as_ref().is_some_and(|s| s.is_invalid());
-                    if dead {
-                        player = None;
-                        events = None;
-                        start_session(false, false);
-                    }
-                    match &player {
-                        Some((p, _)) => {
-                            queue = q; idx = i;
-                            load(p, &queue[idx]);
-                            out.send(Ev::NowPlaying(queue[idx].clone()));
-                        }
-                        None => { out.status("connecting... will play when ready"); pending = Some((q, i)); }
-                    }
+                Cmd::Play(q, i) => if !q.is_empty() { pb.set_queue(q, i) },
+                Cmd::Jump(i) => if pb.queue.jump(i) { pb.start_current() },
+                Cmd::Toggle => pb.toggle(),
+                Cmd::Next => pb.next(),
+                Cmd::Prev => pb.prev(),
+                Cmd::Seek(ms) => if let Some((p, _)) = &pb.player { p.seek(ms) },
+                Cmd::CycleRepeat => {
+                    pb.queue.repeat = pb.queue.repeat.cycled();
+                    cfg.repeat = pb.queue.repeat;
+                    cfg.save();
+                    pb.publish_modes();
+                    pb.maybe_autoplay();
                 }
-                Cmd::Toggle => if let Some((p, _)) = &player { if playing { p.pause() } else { p.play() } },
-                Cmd::Next => if let Some((p, _)) = &player
-                    && idx + 1 < queue.len()
-                {
-                    idx += 1; load(p, &queue[idx]); out.send(Ev::NowPlaying(queue[idx].clone()));
-                },
-                Cmd::Prev => if let Some((p, _)) = &player {
-                    let now = if playing { pos.0 + pos.1.elapsed().as_millis() as u32 } else { pos.0 };
-                    if now > 3000 || idx == 0 { p.seek(0); }
-                    else { idx -= 1; load(p, &queue[idx]); out.send(Ev::NowPlaying(queue[idx].clone())); }
-                },
-                Cmd::Seek(ms) => if let Some((p, _)) = &player { p.seek(ms) },
+                Cmd::ToggleShuffle => {
+                    pb.queue.set_shuffle(!pb.queue.shuffle);
+                    cfg.shuffle = pb.queue.shuffle;
+                    cfg.save();
+                    pb.publish_modes();
+                    pb.publish_queue();
+                }
+                Cmd::ToggleAutoplay => {
+                    pb.autoplay = !pb.autoplay;
+                    pb.auto_exhausted = false;
+                    cfg.autoplay = Some(pb.autoplay);
+                    cfg.save();
+                    pb.publish_modes();
+                    pb.maybe_autoplay();
+                }
                 Cmd::Volume(v) => {
-                    if let Some((_, m)) = &player { m.set_volume(v) }
+                    if let Some((_, m)) = &pb.player { m.set_volume(v) }
                     volume.store(v, Ordering::Relaxed);
                     cfg.volume = Some(v); cfg.save();
                 }
                 Cmd::View(v) => { cfg.last_view = Some(v); cfg.save(); }
             },
             else => break,
+        }
+        if pb.player.is_none() {
+            events = None;
+        }
+        if std::mem::take(&mut pb.reconnect) {
+            start_session(false, false);
         }
     }
 }

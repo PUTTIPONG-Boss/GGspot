@@ -1,6 +1,6 @@
 # GGspot
 
-A tiny, terminal-style Spotify player for Windows. It's for listening and nothing else: search, playlists, liked songs, artist pages. No home feed, no cover art, no browser engine.
+A tiny, terminal-style Spotify player for Windows. It's for listening and nothing else: search, playlists, liked songs, artist pages, shuffle, repeat and autoplay. No home feed, no cover art, no browser engine.
 
 Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/librespot-org/librespot). **Playback needs Spotify Premium.**
 
@@ -18,6 +18,7 @@ Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/
 
 1. Run `ggspot.exe` and press **[ login with spotify ]**. This opens the normal Spotify login page in your browser (email, Google or Apple). You only do this once.
 2. Double-click a song to play it. Click an artist name to see their top tracks and discography.
+3. When the queue runs out, **[auto]** keeps going with similar songs, like Spotify's autoplay. Open **queue** in the sidebar to see what's next.
 
 | Key | Action |
 |---|---|
@@ -25,6 +26,8 @@ Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/
 | `Ctrl+F` | search |
 | `Esc` / `Backspace` | clear search / back from artist page |
 | `Ctrl+Left` / `Ctrl+Right` | previous / next |
+| `Ctrl+S` | shuffle on / off |
+| `Ctrl+R` | repeat: off, all, one |
 | `Up` / `Down`, `Enter` | select, play |
 
 `ggspot.exe --offline` browses the cached library without touching the network.

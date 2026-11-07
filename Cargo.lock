@@ -1533,6 +1533,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "eframe",
+ "fastrand",
  "librespot-core",
  "librespot-metadata",
  "librespot-oauth",

@@ -2,6 +2,7 @@
 
 mod backend;
 mod model;
+mod queue;
 mod ui;
 
 use eframe::egui;
