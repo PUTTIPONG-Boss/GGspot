@@ -4,6 +4,7 @@
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CXSMICON,
     SendMessageW, WM_SETICON,
@@ -11,6 +12,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 /// `set_icon` in build.rs embeds the icon under this resource id.
 const ICON_RESOURCE: usize = 1;
+
+/// Give the taskbar a fixed identity for the app. Without one, Explorer keys its
+/// icon on the exe path and can keep showing a blank page for that path after
+/// the file is replaced. Must run before the window is created.
+pub fn set_app_id() {
+    let id: Vec<u16> = "GGspot.Player".encode_utf16().chain([0]).collect();
+    // SAFETY: `id` is a NUL-terminated UTF-16 string that outlives the call.
+    unsafe {
+        SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+    }
+}
 
 pub fn apply(window: &impl HasWindowHandle) {
     let Ok(handle) = window.window_handle() else { return };

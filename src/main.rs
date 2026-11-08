@@ -10,6 +10,8 @@ mod ui;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    win_icon::set_app_id();
     // Cached library is read before the window opens, so the first frame already has music.
     let lib = model::Library::load();
     let cfg = model::Config::load();
