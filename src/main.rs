@@ -3,6 +3,8 @@
 mod backend;
 mod model;
 mod queue;
+#[cfg(windows)]
+mod win_icon;
 mod ui;
 
 use eframe::egui;
@@ -30,6 +32,8 @@ fn main() -> eframe::Result {
         "GGspot",
         options,
         Box::new(move |cc| {
+            #[cfg(windows)]
+            win_icon::apply(cc);
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             ui::install_style(&cc.egui_ctx);
             backend::spawn(cmd_rx, ev_tx, cc.egui_ctx.clone(), lib.clone());

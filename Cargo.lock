@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "ggspot"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "dirs",
  "eframe",
@@ -1541,9 +1541,11 @@ dependencies = [
  "librespot-protocol",
  "protobuf",
  "protobuf-json-mapping",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tokio",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
