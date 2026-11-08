@@ -16,7 +16,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("GGspot")
+            .with_title(concat!("GGspot v", env!("CARGO_PKG_VERSION")))
             .with_inner_size([880.0, 580.0])
             .with_min_inner_size([520.0, 320.0])
             .with_icon(egui::IconData {
