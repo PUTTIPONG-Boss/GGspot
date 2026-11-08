@@ -209,6 +209,10 @@ fn mode_button(ui: &mut egui::Ui, label: &str, on: bool, tip: &str) -> bool {
     r.clicked()
 }
 
+fn search_id() -> egui::Id {
+    egui::Id::unique("search")
+}
+
 struct ArtistPage {
     uri: String,
     name: String,
@@ -529,6 +533,55 @@ impl App {
         }
     }
 
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Keys: Space play/pause, Ctrl+F search, Esc clear/back, Ctrl+Left/Right prev/next,
+        // Up/Down + Enter play.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        let search_id = search_id();
+        let mut go_back = false;
+        // `input_mut` holds egui's context lock: touching `ctx` inside it deadlocks.
+        let focus_search = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F));
+        if focus_search {
+            ctx.memory_mut(|m| m.request_focus(search_id));
+        }
+        ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::COMMAND, Key::ArrowRight) {
+                let _ = self.cmd.send(Cmd::Next);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::ArrowLeft) {
+                let _ = self.cmd.send(Cmd::Prev);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::S) {
+                let _ = self.cmd.send(Cmd::ToggleShuffle);
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::R) {
+                let _ = self.cmd.send(Cmd::CycleRepeat);
+            }
+            if !typing && i.consume_key(Modifiers::NONE, Key::Space) {
+                let _ = self.cmd.send(Cmd::Toggle);
+            }
+            if !typing && (i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::Backspace)) {
+                go_back = true;
+            }
+        });
+        if go_back {
+            self.back();
+        }
+        if !typing && self.query.is_empty() && !self.need_login {
+            let n = self.current_tracks().len();
+            let (down, up, enter) = ctx.input(|i| (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp), i.key_pressed(Key::Enter)));
+            if n > 0 && down {
+                self.selected = Some(self.selected.map_or(0, |s| (s + 1).min(n - 1)));
+            }
+            if n > 0 && up {
+                self.selected = Some(self.selected.map_or(0, |s| s.saturating_sub(1)));
+            }
+            if enter && let Some(s) = self.selected {
+                self.play_main(s);
+            }
+        }
+    }
+
     fn player_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         let mut open_artist = None;
@@ -631,51 +684,7 @@ impl eframe::App for App {
         }
         self.drain_events(&ctx);
 
-        // Keys: Space play/pause, Ctrl+F search, Esc clear/back, Ctrl+Left/Right prev/next,
-        // Up/Down + Enter play.
-        let typing = ctx.memory(|m| m.focused().is_some());
-        let search_id = egui::Id::unique("search");
-        let mut go_back = false;
-        ctx.input_mut(|i| {
-            if i.consume_key(Modifiers::COMMAND, Key::F) {
-                ctx.memory_mut(|m| m.request_focus(search_id));
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::ArrowRight) {
-                let _ = self.cmd.send(Cmd::Next);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::ArrowLeft) {
-                let _ = self.cmd.send(Cmd::Prev);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::S) {
-                let _ = self.cmd.send(Cmd::ToggleShuffle);
-            }
-            if i.consume_key(Modifiers::COMMAND, Key::R) {
-                let _ = self.cmd.send(Cmd::CycleRepeat);
-            }
-            if !typing && i.consume_key(Modifiers::NONE, Key::Space) {
-                let _ = self.cmd.send(Cmd::Toggle);
-            }
-            if !typing && (i.consume_key(Modifiers::NONE, Key::Escape) || i.consume_key(Modifiers::NONE, Key::Backspace)) {
-                go_back = true;
-            }
-        });
-        if go_back {
-            self.back();
-        }
-        if !typing && self.query.is_empty() && !self.need_login {
-            let n = self.current_tracks().len();
-            let (down, up, enter) = ctx.input(|i| (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp), i.key_pressed(Key::Enter)));
-            if n > 0 && down {
-                self.selected = Some(self.selected.map_or(0, |s| (s + 1).min(n - 1)));
-            }
-            if n > 0 && up {
-                self.selected = Some(self.selected.map_or(0, |s| s.saturating_sub(1)));
-            }
-            if enter && let Some(s) = self.selected {
-                self.play_main(s);
-            }
-        }
-
+        self.handle_keys(&ctx);
         let line = egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(10, 6));
         egui::Panel::top("top").frame(line.stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -683,7 +692,7 @@ impl eframe::App for App {
                 ui.label(RichText::new("search").color(DIM));
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .id(search_id)
+                        .id(search_id())
                         .frame(egui::Frame::NONE)
                         .hint_text(RichText::new("type a song or artist...  (ctrl+f)").color(DIM))
                         .desired_width((ui.available_width() - 260.0).max(160.0)),
@@ -807,5 +816,41 @@ impl eframe::App for App {
         if self.playing {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: Ctrl+F used to deadlock egui's context and freeze the app.
+    #[test]
+    fn ctrl_f_focuses_search_without_freezing() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_ev_tx, ev_rx) = std::sync::mpsc::channel();
+            let mut app = App::new(Library::default(), &Config::default(), cmd_tx, ev_rx);
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::F,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers { ctrl: true, command: true, ..Default::default() },
+                }],
+                ..Default::default()
+            };
+            let mut focused = false;
+            let mut output = ctx.run_ui(input, |ui| {
+                app.handle_keys(ui.ctx());
+                focused = ui.ctx().memory(|m| m.has_focus(search_id()));
+            });
+            output.textures_delta.clear();
+            let _ = done_tx.send(focused);
+        });
+        let focused = done_rx.recv_timeout(Duration::from_secs(5)).expect("Ctrl+F froze the app");
+        assert!(focused, "Ctrl+F should focus the search box");
     }
 }
