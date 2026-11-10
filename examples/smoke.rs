@@ -89,6 +89,15 @@ fn run(cmd: &UnboundedSender<Cmd>, rx: &Receiver<Ev>, c: &mut Checks) -> Option<
     })?;
     c.check("artist page returns songs", !page.is_empty());
 
+    // Cover for a song that is only being pointed at.
+    let hovered = found.last()?.uri.clone();
+    cmd.send(Cmd::HoverCover(hovered.clone())).unwrap();
+    let art = wait(rx, 20, |e| match e {
+        Ev::HoverCover(uri, cells) if uri == hovered => Some(cells),
+        _ => None,
+    })?;
+    c.check("hover cover loads", art.is_some());
+
     // Autoplay: a one-song queue grows, and the next song starts by itself.
     let t = Instant::now();
     cmd.send(Cmd::Play(vec![seed.clone()], 0)).unwrap();

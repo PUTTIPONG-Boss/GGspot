@@ -70,6 +70,8 @@ pub enum Cmd {
     View(String),
     SaveOrder(PlaylistOrder),
     ShowCover(bool),
+    /// Cover of a song under the pointer, not the one playing.
+    HoverCover(String),
 }
 
 pub enum Ev {
@@ -85,6 +87,8 @@ pub enum Ev {
     NowPlaying(Track),
     /// Track URI and its cover blocks; `None` if it has no usable cover.
     Cover(String, Option<Vec<u8>>),
+    /// Same, for `Cmd::HoverCover`.
+    HoverCover(String, Option<Vec<u8>>),
     State { playing: bool, pos_ms: u32 },
     Queue { tracks: Vec<Track>, idx: usize, auto_from: Option<usize> },
     Modes { repeat: Repeat, shuffle: bool, autoplay: bool },
@@ -416,6 +420,16 @@ async fn fetch_cover(session: &Session, track_uri: &str) -> Res<Vec<u8>> {
 
 // ------------------------------------------------------------- Main loop
 
+impl Shared {
+    /// Cover blocks from disk if seen before, else from Spotify.
+    async fn cover(&self, uri: &str) -> Option<Vec<u8>> {
+        match cover::load_cached(uri) {
+            Some(cells) => Some(cells),
+            None => fetch_cover(&self.session().await, uri).await.ok(),
+        }
+    }
+}
+
 struct Shared {
     lib: Mutex<Library>,
     out: Out,
@@ -539,6 +553,7 @@ struct Playback {
     pending: bool,
     reconnect: bool,
     cover_task: Option<tokio::task::JoinHandle<()>>,
+    hover_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Playback {
@@ -589,11 +604,20 @@ impl Playback {
         }
         let shared = self.shared.clone();
         self.cover_task = Some(tokio::spawn(async move {
-            let cells = match cover::load_cached(&uri) {
-                Some(cells) => Some(cells),
-                None => fetch_cover(&shared.session().await, &uri).await.ok(),
-            };
+            let cells = shared.cover(&uri).await;
             shared.out.send(Ev::Cover(uri, cells));
+        }));
+    }
+
+    /// Only the latest song pointed at matters; the one before is cancelled.
+    fn load_hover_cover(&mut self, uri: String) {
+        if let Some(task) = self.hover_task.take() {
+            task.abort();
+        }
+        let shared = self.shared.clone();
+        self.hover_task = Some(tokio::spawn(async move {
+            let cells = shared.cover(&uri).await;
+            shared.out.send(Ev::HoverCover(uri, cells));
         }));
     }
 
@@ -815,6 +839,7 @@ async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
         pending: false,
         reconnect: false,
         cover_task: None,
+        hover_task: None,
     };
     pb.publish_modes();
     let mut events: Option<mpsc::UnboundedReceiver<PlayerEvent>> = None;
@@ -901,6 +926,7 @@ async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
                 Cmd::View(v) => { cfg.last_view = Some(v); cfg.save(); }
                 Cmd::SaveOrder(o) => { cfg.order = o; cfg.save(); }
                 Cmd::ShowCover(on) => { cfg.show_cover = Some(on); cfg.save(); }
+                Cmd::HoverCover(uri) => pb.load_hover_cover(uri),
             },
             else => break,
         }

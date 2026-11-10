@@ -21,7 +21,7 @@ Press `Ctrl+M` for mini mode: a spinning record over the cover in coloured ASCII
 ## Use
 
 1. Run `ggspot.exe` and press **[ login with spotify ]**. This opens the normal Spotify login page in your browser (email, Google or Apple). You only do this once.
-2. Double-click a song to play it. Click an artist name to see their top tracks and discography.
+2. Double-click a song to play it. Click an artist name to see their top tracks and discography. Rest the pointer on a song to see its cover in ASCII.
 3. When the queue runs out, **[auto]** keeps going with similar songs, like Spotify's autoplay. Open **queue** in the sidebar to see what's next.
 
 | Key | Action |

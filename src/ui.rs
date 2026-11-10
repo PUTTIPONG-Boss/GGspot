@@ -24,10 +24,19 @@ const QUEUE_VIEW: &str = "queue";
 
 pub const FULL_SIZE: [f32; 2] = [880.0, 580.0];
 pub const FULL_MIN: [f32; 2] = [520.0, 320.0];
-const MINI_SIZE: [f32; 2] = [340.0, 460.0];
+const MINI_SIZE: [f32; 2] = [340.0, 484.0];
 const MINI_MIN: [f32; 2] = [310.0, 340.0];
 const ASCII_FONT: f32 = 12.0;
 const ASCII_LINE: f32 = 14.0;
+const TITLE_H: f32 = 22.0;
+/// Pointing at a song this long shows its cover. Passing over one fetches nothing.
+const HOVER_DELAY: Duration = Duration::from_millis(250);
+const HOVER_COLS: usize = 44;
+const HOVER_FONT: f32 = 10.0;
+const HOVER_LINE: f32 = 11.0;
+/// How close to the window's edge the pointer can resize it.
+const EDGE: f32 = 5.0;
+const CLOSE_HOVER: Color32 = Color32::from_rgb(255, 95, 86);
 
 // Terminal palette.
 const BG: Color32 = Color32::from_rgb(10, 13, 10);
@@ -219,8 +228,57 @@ fn mode_button(ui: &mut egui::Ui, label: &str, on: bool, tip: &str) -> bool {
     r.clicked()
 }
 
+/// A small "[x]" window control.
+fn title_button(ui: &mut egui::Ui, label: &str, hover: Color32) -> bool {
+    let font = FontId::monospace(12.0);
+    let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '_'));
+    let (rect, r) = ui.allocate_exact_size(vec2(cw * label.chars().count() as f32 + 8.0, TITLE_H), Sense::click());
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, if r.hovered() { hover } else { DIM });
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    r.clicked()
+}
+
+fn is_maximized(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().maximized.unwrap_or(false))
+}
+
 fn search_id() -> egui::Id {
     egui::Id::unique("search")
+}
+
+/// The cover popup for the song under the pointer.
+struct HoverArt {
+    uri: String,
+    since: Instant,
+    anchor: egui::Pos2,
+    asked: bool,
+    galley: Option<std::sync::Arc<egui::Galley>>,
+}
+
+fn glyph_width(ctx: &egui::Context, size: f32) -> f32 {
+    ctx.fonts_mut(|f| f.glyph_width(&FontId::monospace(size), '#'))
+}
+
+/// `disc::ascii` as one block of text, coloured character by character.
+fn ascii_galley(ctx: &egui::Context, rgb: &[u8], cols: usize, rows: usize, size: f32, line: f32) -> std::sync::Arc<egui::Galley> {
+    let font = FontId::monospace(size);
+    let mut job = egui::text::LayoutJob::default();
+    let mut buf = [0; 4];
+    for (i, (ch, [r, g, b])) in disc::ascii(rgb, cols, rows, line / glyph_width(ctx, size)).into_iter().enumerate() {
+        let format = egui::TextFormat {
+            font_id: font.clone(),
+            color: Color32::from_rgb(r, g, b),
+            line_height: Some(line),
+            ..Default::default()
+        };
+        if i > 0 && i % cols == 0 {
+            job.append("\n", 0.0, format.clone());
+        }
+        job.append(ch.encode_utf8(&mut buf), 0.0, format);
+    }
+    ctx.fonts_mut(|f| f.layout_job(job))
 }
 
 struct ArtistPage {
@@ -254,12 +312,16 @@ pub struct App {
     cover_rgb: Option<Vec<u8>>,
     /// Goes up with every new cover, so the art made from it is redrawn.
     cover_gen: u32,
+    /// Where the window controls are, so the corner above them doesn't resize.
+    title_buttons: Rect,
     mini: bool,
     /// Window to return to when leaving mini mode.
     full_size: Option<egui::Vec2>,
     full_maximized: bool,
     /// Keyed by cover generation and rotation step.
     disc: Option<((u32, u32), egui::TextureHandle)>,
+    hovered_row: Option<String>,
+    hover: Option<HoverArt>,
     /// Keyed by cover generation and characters across and down.
     ascii: Option<((u32, usize, usize), std::sync::Arc<egui::Galley>)>,
     playing: bool,
@@ -302,10 +364,13 @@ impl App {
             show_cover: cfg.show_cover.unwrap_or(true),
             cover_rgb: None,
             cover_gen: 0,
+            title_buttons: Rect::NOTHING,
             mini: false,
             full_size: None,
             full_maximized: false,
             disc: None,
+            hovered_row: None,
+            hover: None,
             ascii: None,
             playing: false,
             pos: (0, Instant::now()),
@@ -426,6 +491,104 @@ impl App {
         }
     }
 
+    /// After resting on a song for a moment, its cover in ASCII beside the pointer.
+    fn show_hover_art(&mut self, ctx: &egui::Context) {
+        let Some(uri) = self.hovered_row.take().filter(|_| self.show_cover) else {
+            self.hover = None;
+            return;
+        };
+        if self.hover.as_ref().is_none_or(|h| h.uri != uri) {
+            let Some(anchor) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+            self.hover = Some(HoverArt { uri: uri.clone(), since: Instant::now(), anchor, asked: false, galley: None });
+        }
+        let Some(hover) = self.hover.as_mut() else { return };
+        if !hover.asked {
+            match HOVER_DELAY.checked_sub(hover.since.elapsed()) {
+                Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
+                _ => {
+                    hover.asked = true;
+                    let _ = self.cmd.send(Cmd::HoverCover(uri));
+                }
+            }
+        }
+        let Some(galley) = hover.galley.clone() else { return };
+        let (r, p) = (ctx.content_rect(), hover.anchor);
+        let size = galley.size() + vec2(14.0, 14.0);
+        let x = if p.x + 18.0 + size.x <= r.right() { p.x + 18.0 } else { (p.x - 18.0 - size.x).max(r.left()) };
+        let y = (p.y - size.y / 2.0).min(r.bottom() - size.y).max(r.top() + TITLE_H);
+        egui::Area::new(egui::Id::unique("hover_art"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::pos2(x, y))
+            .interactable(false)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.fill(BG_INPUT).stroke(Stroke::new(1.0, BORDER)).inner_margin(6).show(ui, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+                    ui.painter().galley(rect.min, galley.clone(), FG);
+                });
+            });
+    }
+
+    /// Our own window frame: a thin terminal line in place of the Windows title bar.
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("titlebar").frame(egui::Frame::NONE.fill(BG_INPUT)).show(ui, |ui| {
+            let ctx = ui.ctx().clone();
+            let maximized = is_maximized(&ctx);
+            let bar = Rect::from_min_size(ui.max_rect().min, vec2(ui.available_width(), TITLE_H));
+            let drag = ui.interact(bar, egui::Id::unique("titlebar_drag"), Sense::click_and_drag());
+            if drag.double_clicked() && !self.mini {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            } else if drag.drag_started_by(egui::PointerButton::Primary) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            let font = FontId::monospace(12.0);
+            let name = ui.painter().text(bar.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, "ggspot", font.clone(), ACCENT);
+            let version = concat!("v", env!("CARGO_PKG_VERSION"));
+            ui.painter().text(name.right_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, version, font, DIM);
+            ui.allocate_ui_with_layout(bar.size(), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(4.0);
+                if title_button(ui, "[x]", CLOSE_HOVER) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if !self.mini && title_button(ui, if maximized { "[=]" } else { "[#]" }, ACCENT) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                if title_button(ui, "[_]", ACCENT) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                self.title_buttons = ui.min_rect();
+            });
+        });
+    }
+
+    /// Without a Windows frame, resizing from the window's edges is up to us.
+    fn window_edges(&self, ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection as Dir;
+        if is_maximized(ctx) {
+            return;
+        }
+        let Some(p) = ctx.input(|i| i.pointer.hover_pos()).filter(|p| !self.title_buttons.contains(*p)) else { return };
+        let r = ctx.content_rect();
+        let (north, south) = (p.y < r.top() + EDGE, p.y > r.bottom() - EDGE);
+        let (west, east) = (p.x < r.left() + EDGE, p.x > r.right() - EDGE);
+        let (dir, cursor) = match (north, south, west, east) {
+            (true, _, true, _) => (Dir::NorthWest, CursorIcon::ResizeNwSe),
+            (true, _, _, true) => (Dir::NorthEast, CursorIcon::ResizeNeSw),
+            (_, true, true, _) => (Dir::SouthWest, CursorIcon::ResizeNeSw),
+            (_, true, _, true) => (Dir::SouthEast, CursorIcon::ResizeNwSe),
+            (true, ..) => (Dir::North, CursorIcon::ResizeVertical),
+            (_, true, ..) => (Dir::South, CursorIcon::ResizeVertical),
+            (_, _, true, _) => (Dir::West, CursorIcon::ResizeHorizontal),
+            (_, _, _, true) => (Dir::East, CursorIcon::ResizeHorizontal),
+            _ => return,
+        };
+        ctx.set_cursor_icon(cursor);
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
+
     /// Shrink to the record, or go back to the window as it was.
     fn set_mini(&mut self, ctx: &egui::Context, on: bool) {
         if on == self.mini || (on && self.need_login) {
@@ -455,27 +618,11 @@ impl App {
     /// The cover in coloured characters. Laid out once per cover and window size.
     fn paint_ascii(&mut self, ui: &mut egui::Ui, area: Rect) {
         let Some(rgb) = &self.cover_rgb else { return };
-        let font = FontId::monospace(ASCII_FONT);
-        let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '#'));
+        let cw = glyph_width(ui.ctx(), ASCII_FONT);
         let (cols, rows) = ((area.width() / cw).ceil() as usize, (area.height() / ASCII_LINE).ceil() as usize);
         let key = (self.cover_gen, cols, rows);
         if self.ascii.as_ref().is_none_or(|(k, _)| *k != key) {
-            let mut job = egui::text::LayoutJob::default();
-            let mut buf = [0; 4];
-            for (i, (ch, [r, g, b])) in disc::ascii(rgb, cols, rows, ASCII_LINE / cw).into_iter().enumerate() {
-                let format = egui::TextFormat {
-                    font_id: font.clone(),
-                    color: Color32::from_rgb(r, g, b),
-                    line_height: Some(ASCII_LINE),
-                    ..Default::default()
-                };
-                if i > 0 && i % cols == 0 {
-                    job.append("\n", 0.0, format.clone());
-                }
-                job.append(ch.encode_utf8(&mut buf), 0.0, format);
-            }
-            let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-            self.ascii = Some((key, galley));
+            self.ascii = Some((key, ascii_galley(ui.ctx(), rgb, cols, rows, ASCII_FONT, ASCII_LINE)));
         }
         if let Some((_, galley)) = &self.ascii {
             ui.painter().with_clip_rect(area).galley(area.min, galley.clone(), FG);
@@ -611,6 +758,12 @@ impl App {
                         self.cover_gen += 1;
                     }
                 }
+                Ev::HoverCover(uri, cells) => {
+                    if let (Some(hover), Some(rgb)) = (self.hover.as_mut().filter(|h| h.uri == uri), cells) {
+                        let rows = (HOVER_COLS as f32 * glyph_width(ctx, HOVER_FONT) / HOVER_LINE).round() as usize;
+                        hover.galley = Some(ascii_galley(ctx, &rgb, HOVER_COLS, rows, HOVER_FONT, HOVER_LINE));
+                    }
+                }
                 Ev::NowPlaying(t) => {
                     self.now = Some(t);
                     self.pos = (0, Instant::now());
@@ -725,6 +878,9 @@ impl App {
                 if ar.hovered() {
                     p.line_segment([hit.left_bottom(), hit.right_bottom()], Stroke::new(1.0, ACCENT));
                     ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.hovered() || ar.hovered() {
+                    self.hovered_row = Some(t.uri.clone());
                 }
                 if ar.clicked() {
                     artist = Some(t.clone());
@@ -952,6 +1108,12 @@ impl eframe::App for App {
         if self.need_login {
             self.set_mini(&ctx, false);
         }
+        self.title_bar(ui);
+        self.window_edges(&ctx);
+        if !is_maximized(&ctx) {
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("window_border"));
+            ctx.layer_painter(layer).rect_stroke(ctx.content_rect(), 0.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+        }
         if self.mini {
             self.mini_view(ui);
             if self.playing {
@@ -1101,6 +1263,8 @@ impl eframe::App for App {
             }
         });
 
+        self.show_hover_art(&ctx);
+
         // Debounced remote search.
         if let Some(t) = self.query_edited {
             let q = self.query.trim().to_string();
@@ -1191,6 +1355,126 @@ mod tests {
         keys(&mut app, &ctx, ctrl(Key::M));
         keys(&mut app, &ctx, ctrl(Key::F));
         assert!(!app.mini);
+    }
+
+    fn hover_frame(app: &mut App, ctx: &egui::Context, uri: Option<&str>) {
+        app.hovered_row = uri.map(String::from);
+        let events = vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0))];
+        let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.show_hover_art(ui.ctx()));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_song_is_only_fetched_after_resting_on_it_and_stale_covers_are_dropped() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Library::default(), &Config::default(), cmd_tx, ev_rx);
+        let ctx = egui::Context::default();
+        hover_frame(&mut app, &ctx, Some("a"));
+        hover_frame(&mut app, &ctx, Some("b"));
+        assert!(cmd_rx.try_recv().is_err(), "passing over a song fetches nothing");
+
+        app.hover.as_mut().unwrap().since -= HOVER_DELAY;
+        hover_frame(&mut app, &ctx, Some("b"));
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::HoverCover(u)) if u == "b"));
+        hover_frame(&mut app, &ctx, Some("b"));
+        assert!(cmd_rx.try_recv().is_err(), "asks once");
+
+        let cells = vec![9; (cover::CELLS * cover::CELLS * 3) as usize];
+        ev_tx.send(Ev::HoverCover("a".into(), Some(cells.clone()))).unwrap();
+        app.drain_events(&ctx);
+        assert!(app.hover.as_ref().unwrap().galley.is_none(), "reply for a song no longer pointed at");
+        ev_tx.send(Ev::HoverCover("b".into(), Some(cells))).unwrap();
+        app.drain_events(&ctx);
+        assert!(app.hover.as_ref().unwrap().galley.is_some());
+
+        hover_frame(&mut app, &ctx, None);
+        assert!(app.hover.is_none(), "gone when the pointer leaves");
+    }
+
+    #[test]
+    fn hover_art_follows_the_art_switch() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.show_cover = false;
+        hover_frame(&mut app, &ctx, Some("a"));
+        assert!(app.hover.is_none());
+    }
+
+    /// One frame of the window frame's code at the default size; returns what it asked Windows to do.
+    fn frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<egui::ViewportCommand> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(880.0, 580.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.title_bar(ui);
+            app.window_edges(ui.ctx());
+        });
+        output.textures_delta.clear();
+        output.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    /// Hover, press and release at `pos`; returns everything asked of Windows.
+    fn click(app: &mut App, ctx: &egui::Context, pos: egui::Pos2) -> Vec<egui::ViewportCommand> {
+        let mut out = frame(app, ctx, vec![egui::Event::PointerMoved(pos)]);
+        out.extend(frame(app, ctx, vec![button(pos, true)]));
+        out.extend(frame(app, ctx, vec![button(pos, false)]));
+        out
+    }
+
+    #[test]
+    fn window_controls_do_what_they_say() {
+        use egui::ViewportCommand as V;
+        let ctx = egui::Context::default();
+        let mut app = app();
+        frame(&mut app, &ctx, Vec::new());
+        let group = app.title_buttons;
+        assert!(group.width() > 60.0 && group.right() > 870.0, "{group:?}");
+        let y = group.center().y;
+        assert!(click(&mut app, &ctx, egui::pos2(group.right() - 19.0, y)).contains(&V::Close));
+        assert!(click(&mut app, &ctx, egui::pos2(group.center().x, y)).contains(&V::Maximized(true)));
+        assert!(click(&mut app, &ctx, egui::pos2(group.left() + 14.0, y)).contains(&V::Minimized(true)));
+    }
+
+    #[test]
+    fn dragging_the_title_moves_the_window_and_edges_resize_it() {
+        use egui::{ViewportCommand as V, viewport::ResizeDirection as Dir};
+        let ctx = egui::Context::default();
+        let mut app = app();
+        frame(&mut app, &ctx, Vec::new());
+        let (from, to) = (egui::pos2(300.0, 11.0), egui::pos2(340.0, 30.0));
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(from)]);
+        frame(&mut app, &ctx, vec![button(from, true)]);
+        let moved = frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to)]);
+        assert!(moved.contains(&V::StartDrag), "{moved:?}");
+        frame(&mut app, &ctx, vec![button(to, false)]);
+
+        for (pos, dir) in [
+            (egui::pos2(878.0, 300.0), Dir::East),
+            (egui::pos2(2.0, 300.0), Dir::West),
+            (egui::pos2(400.0, 578.0), Dir::South),
+            (egui::pos2(878.0, 578.0), Dir::SouthEast),
+        ] {
+            assert!(click(&mut app, &ctx, pos).contains(&V::BeginResize(dir)), "{dir:?}");
+        }
+    }
+
+    #[test]
+    fn the_corner_above_close_closes_instead_of_resizing() {
+        use egui::ViewportCommand as V;
+        let ctx = egui::Context::default();
+        let mut app = app();
+        frame(&mut app, &ctx, Vec::new());
+        let pos = egui::pos2(app.title_buttons.right() - 19.0, 2.0);
+        let out = click(&mut app, &ctx, pos);
+        assert!(out.contains(&V::Close), "{out:?}");
+        assert!(!out.iter().any(|c| matches!(c, V::BeginResize(_))), "{out:?}");
     }
 
     #[test]
