@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{Cmd, Ev};
 use crate::cover;
+use crate::disc;
 use crate::model::*;
 use crate::order::{PlaylistOrder, SortMode};
 use crate::queue::Repeat;
@@ -20,6 +21,13 @@ const ROW_H: f32 = 24.0;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 const ARTIST_VIEW: &str = "artist";
 const QUEUE_VIEW: &str = "queue";
+
+pub const FULL_SIZE: [f32; 2] = [880.0, 580.0];
+pub const FULL_MIN: [f32; 2] = [520.0, 320.0];
+const MINI_SIZE: [f32; 2] = [340.0, 460.0];
+const MINI_MIN: [f32; 2] = [280.0, 340.0];
+const ASCII_FONT: f32 = 12.0;
+const ASCII_LINE: f32 = 14.0;
 
 // Terminal palette.
 const BG: Color32 = Color32::from_rgb(10, 13, 10);
@@ -243,6 +251,17 @@ pub struct App {
     scroll_sidebar: bool,
     cover: Option<egui::TextureHandle>,
     show_cover: bool,
+    cover_rgb: Option<Vec<u8>>,
+    /// Goes up with every new cover, so the art made from it is redrawn.
+    cover_gen: u32,
+    mini: bool,
+    /// Window to return to when leaving mini mode.
+    full_size: Option<egui::Vec2>,
+    full_maximized: bool,
+    /// Keyed by cover generation and rotation step.
+    disc: Option<((u32, u32), egui::TextureHandle)>,
+    /// Keyed by cover generation and characters across and down.
+    ascii: Option<((u32, usize, usize), std::sync::Arc<egui::Galley>)>,
     playing: bool,
     pos: (u32, Instant),
     seek: Option<f32>,
@@ -281,6 +300,13 @@ impl App {
             scroll_sidebar: false,
             cover: None,
             show_cover: cfg.show_cover.unwrap_or(true),
+            cover_rgb: None,
+            cover_gen: 0,
+            mini: false,
+            full_size: None,
+            full_maximized: false,
+            disc: None,
+            ascii: None,
             playing: false,
             pos: (0, Instant::now()),
             seek: None,
@@ -400,6 +426,121 @@ impl App {
         }
     }
 
+    /// Shrink to the record, or go back to the window as it was.
+    fn set_mini(&mut self, ctx: &egui::Context, on: bool) {
+        if on == self.mini || (on && self.need_login) {
+            return;
+        }
+        self.mini = on;
+        if on {
+            let (size, maximized) =
+                ctx.input(|i| (i.viewport().inner_rect.map(|r| r.size()), i.viewport().maximized.unwrap_or(false)));
+            self.full_size = size;
+            self.full_maximized = maximized;
+            if maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MINI_MIN.into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(MINI_SIZE.into()));
+        } else {
+            let size = self.full_size.take().unwrap_or(FULL_SIZE.into());
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(FULL_MIN.into()));
+            if self.full_maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        }
+    }
+
+    /// The cover in coloured characters. Laid out once per cover and window size.
+    fn paint_ascii(&mut self, ui: &mut egui::Ui, area: Rect) {
+        let Some(rgb) = &self.cover_rgb else { return };
+        let font = FontId::monospace(ASCII_FONT);
+        let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '#'));
+        let (cols, rows) = ((area.width() / cw).ceil() as usize, (area.height() / ASCII_LINE).ceil() as usize);
+        let key = (self.cover_gen, cols, rows);
+        if self.ascii.as_ref().is_none_or(|(k, _)| *k != key) {
+            let mut job = egui::text::LayoutJob::default();
+            let mut buf = [0; 4];
+            for (i, (ch, [r, g, b])) in disc::ascii(rgb, cols, rows, ASCII_LINE / cw).into_iter().enumerate() {
+                let format = egui::TextFormat {
+                    font_id: font.clone(),
+                    color: Color32::from_rgb(r, g, b),
+                    line_height: Some(ASCII_LINE),
+                    ..Default::default()
+                };
+                if i > 0 && i % cols == 0 {
+                    job.append("\n", 0.0, format.clone());
+                }
+                job.append(ch.encode_utf8(&mut buf), 0.0, format);
+            }
+            let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+            self.ascii = Some((key, galley));
+        }
+        if let Some((_, galley)) = &self.ascii {
+            ui.painter().with_clip_rect(area).galley(area.min, galley.clone(), FG);
+        }
+    }
+
+    /// The record, centred in `area`, in square blocks like the sidebar cover.
+    fn paint_disc(&mut self, ui: &mut egui::Ui, area: Rect) {
+        let step = self.position() / disc::STEP_MS;
+        let key = (self.cover_gen, step);
+        if self.disc.as_ref().is_none_or(|(k, _)| *k != key) {
+            let rgba = disc::render(self.cover_rgb.as_deref(), disc::angle(step));
+            let image = egui::ColorImage::from_rgba_unmultiplied([disc::SIZE, disc::SIZE], &rgba);
+            match &mut self.disc {
+                Some((k, tex)) => {
+                    tex.set(image, egui::TextureOptions::NEAREST);
+                    *k = key;
+                }
+                None => self.disc = Some((key, ui.ctx().load_texture("disc", image, egui::TextureOptions::NEAREST))),
+            }
+        }
+        let Some((_, tex)) = &self.disc else { return };
+        let blocks = disc::SIZE as f32;
+        let block = ((area.width().min(area.height()) - 24.0) / blocks).floor().max(2.0);
+        let rect = Rect::from_center_size(area.center().round(), vec2(blocks * block, blocks * block));
+        let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+    }
+
+    fn mini_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        match &self.now {
+            Some(t) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(if self.playing { "▶" } else { "‖" }).color(ACCENT));
+                    ui.add(egui::Label::new(RichText::new(&t.name).color(FG)).truncate());
+                });
+                ui.add(egui::Label::new(RichText::new(&t.artists).color(DIM)).truncate());
+            }
+            None => {
+                ui.label(RichText::new("-- nothing playing --").color(DIM));
+            }
+        }
+        ui.horizontal(|ui| self.progress_row(ui, 84.0));
+        ui.horizontal(|ui| {
+            self.transport(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if mode_button(ui, "[full]", true, "back to the full window (ctrl+m)") {
+                    let ctx = ui.ctx().clone();
+                    self.set_mini(&ctx, false);
+                }
+            });
+        });
+    }
+
+    fn mini_view(&mut self, ui: &mut egui::Ui) {
+        let line = egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(10, 6));
+        egui::Panel::bottom("mini").frame(line.stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| self.mini_bar(ui));
+        egui::CentralPanel::default_margins().frame(egui::Frame::NONE.fill(BG)).show(ui, |ui| {
+            let area = ui.max_rect();
+            self.paint_ascii(ui, area);
+            self.paint_disc(ui, area);
+        });
+    }
+
     fn cycle_sort(&mut self) {
         self.order.mode = self.order.mode.cycled();
         self.scroll_sidebar = true;
@@ -457,10 +598,12 @@ impl App {
                 Ev::Cover(uri, cells) => {
                     if self.now.as_ref().is_some_and(|t| t.uri == uri) {
                         let side = cover::CELLS as usize;
-                        self.cover = cells.map(|rgb| {
-                            let image = egui::ColorImage::from_rgb([side, side], &rgb);
+                        self.cover = cells.as_deref().map(|rgb| {
+                            let image = egui::ColorImage::from_rgb([side, side], rgb);
                             ctx.load_texture("cover", image, egui::TextureOptions::NEAREST)
                         });
+                        self.cover_rgb = cells;
+                        self.cover_gen += 1;
                     }
                 }
                 Ev::NowPlaying(t) => {
@@ -608,14 +751,18 @@ impl App {
         let mut go_back = false;
         // `input_mut` holds egui's context lock: touching `ctx` inside it deadlocks.
         let focus_search = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F));
-        let (move_up, move_down, cycle_sort, toggle_cover) = ctx.input_mut(|i| {
+        let (move_up, move_down, cycle_sort, toggle_cover, toggle_mini) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::ALT, Key::ArrowUp),
                 i.consume_key(Modifiers::ALT, Key::ArrowDown),
                 i.consume_key(Modifiers::COMMAND, Key::O),
                 i.consume_key(Modifiers::COMMAND, Key::I),
+                i.consume_key(Modifiers::COMMAND, Key::M),
             )
         });
+        if toggle_mini {
+            self.set_mini(ctx, !self.mini);
+        }
         if toggle_cover {
             self.toggle_cover();
         }
@@ -629,6 +776,7 @@ impl App {
             self.cycle_sort();
         }
         if focus_search {
+            self.set_mini(ctx, false);
             ctx.memory_mut(|m| m.request_focus(search_id));
         }
         ctx.input_mut(|i| {
@@ -652,9 +800,13 @@ impl App {
             }
         });
         if go_back {
-            self.back();
+            if self.mini {
+                self.set_mini(ctx, false);
+            } else {
+                self.back();
+            }
         }
-        if !typing && self.query.is_empty() && !self.need_login {
+        if !typing && self.query.is_empty() && !self.need_login && !self.mini {
             let n = self.current_tracks().len();
             let (down, up, enter) = ctx.input(|i| (i.key_pressed(Key::ArrowDown), i.key_pressed(Key::ArrowUp), i.key_pressed(Key::Enter)));
             if n > 0 && down {
@@ -669,19 +821,51 @@ impl App {
         }
     }
 
+    fn transport(&self, ui: &mut egui::Ui) {
+        if text_button(ui, "[|<]") {
+            self.send(Cmd::Prev);
+        }
+        if text_button(ui, if self.playing { "[ || ]" } else { "[ >  ]" }) {
+            self.send(Cmd::Toggle);
+        }
+        if text_button(ui, "[>|]") {
+            self.send(Cmd::Next);
+        }
+    }
+
+    /// Elapsed, seek bar, duration. `reserved` is the width left free after the bar starts.
+    fn progress_row(&mut self, ui: &mut egui::Ui, reserved: f32) {
+        let dur = self.now.as_ref().map_or(0, |t| t.ms);
+        let shown = self.seek.map_or(self.position(), |f| (f * dur as f32) as u32);
+        ui.label(RichText::new(fmt_ms(shown)).color(DIM));
+        let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&FontId::monospace(14.0), '='));
+        let chars = ((ui.available_width() - reserved) / cw).max(10.0) as usize;
+        let frac = if dur == 0 { 0.0 } else { shown as f32 / dur as f32 };
+        let dragging = ui.input(|i| i.pointer.primary_down());
+        match ascii_bar(ui, "progress", frac, chars) {
+            Some(f) if dragging => self.seek = Some(f),
+            Some(f) => {
+                let ms = (f * dur as f32) as u32;
+                self.send(Cmd::Seek(ms));
+                self.pos = (ms, Instant::now());
+                self.seek = None;
+            }
+            None => {
+                if let Some(f) = self.seek.take().filter(|_| !dragging) {
+                    let ms = (f * dur as f32) as u32;
+                    self.send(Cmd::Seek(ms));
+                    self.pos = (ms, Instant::now());
+                }
+            }
+        }
+        ui.label(RichText::new(fmt_ms(dur)).color(DIM));
+    }
+
     fn player_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         let mut open_artist = None;
         ui.horizontal(|ui| {
-            if text_button(ui, "[|<]") {
-                self.send(Cmd::Prev);
-            }
-            if text_button(ui, if self.playing { "[ || ]" } else { "[ >  ]" }) {
-                self.send(Cmd::Toggle);
-            }
-            if text_button(ui, "[>|]") {
-                self.send(Cmd::Next);
-            }
+            self.transport(ui);
             ui.add_space(6.0);
             if mode_button(ui, "[shuf]", self.shuffle, "shuffle (ctrl+s)") {
                 self.send(Cmd::ToggleShuffle);
@@ -699,6 +883,10 @@ impl App {
             }
             if mode_button(ui, "[art]", self.show_cover, "album cover (ctrl+i)") {
                 self.toggle_cover();
+            }
+            if mode_button(ui, "[mini]", true, "mini mode: spinning record (ctrl+m)") {
+                let ctx = ui.ctx().clone();
+                self.set_mini(&ctx, true);
             }
             ui.add_space(10.0);
             match &self.now {
@@ -720,30 +908,7 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
-            let dur = self.now.as_ref().map_or(0, |t| t.ms);
-            let shown = self.seek.map_or(self.position(), |f| (f * dur as f32) as u32);
-            ui.label(RichText::new(fmt_ms(shown)).color(DIM));
-            let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&FontId::monospace(14.0), '='));
-            let chars = ((ui.available_width() - 260.0) / cw).max(10.0) as usize;
-            let frac = if dur == 0 { 0.0 } else { shown as f32 / dur as f32 };
-            let dragging = ui.input(|i| i.pointer.primary_down());
-            match ascii_bar(ui, "progress", frac, chars) {
-                Some(f) if dragging => self.seek = Some(f),
-                Some(f) => {
-                    let ms = (f * dur as f32) as u32;
-                    self.send(Cmd::Seek(ms));
-                    self.pos = (ms, Instant::now());
-                    self.seek = None;
-                }
-                None => {
-                    if let Some(f) = self.seek.take().filter(|_| !dragging) {
-                        let ms = (f * dur as f32) as u32;
-                        self.send(Cmd::Seek(ms));
-                        self.pos = (ms, Instant::now());
-                    }
-                }
-            }
-            ui.label(RichText::new(fmt_ms(dur)).color(DIM));
+            self.progress_row(ui, 260.0);
             ui.add_space(16.0);
             ui.label(RichText::new("vol").color(DIM));
             if let Some(v) = ascii_bar(ui, "volume", self.volume, 10) {
@@ -775,6 +940,16 @@ impl eframe::App for App {
         self.drain_events(&ctx);
 
         self.handle_keys(&ctx);
+        if self.need_login {
+            self.set_mini(&ctx, false);
+        }
+        if self.mini {
+            self.mini_view(ui);
+            if self.playing {
+                ctx.request_repaint_after(Duration::from_millis(disc::STEP_MS as u64));
+            }
+            return;
+        }
         let line = egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(10, 6));
         egui::Panel::top("top").frame(line.stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -976,6 +1151,46 @@ mod tests {
         assert_eq!(order, ["b", "a"]);
         assert_eq!(app.order.mode, SortMode::Custom);
         assert_eq!(app.selected, None);
+    }
+
+    fn ctrl(key: Key) -> egui::RawInput {
+        pressed(key, Modifiers { ctrl: true, command: true, ..Default::default() })
+    }
+
+    fn app() -> App {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_ev_tx, ev_rx) = std::sync::mpsc::channel();
+        App::new(Library::default(), &Config::default(), cmd_tx, ev_rx)
+    }
+
+    fn keys(app: &mut App, ctx: &egui::Context, input: egui::RawInput) {
+        let mut output = ctx.run_ui(input, |ui| app.handle_keys(ui.ctx()));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn ctrl_m_toggles_mini_and_esc_or_ctrl_f_leave_it() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        keys(&mut app, &ctx, ctrl(Key::M));
+        assert!(app.mini);
+        keys(&mut app, &ctx, ctrl(Key::M));
+        assert!(!app.mini);
+        keys(&mut app, &ctx, ctrl(Key::M));
+        keys(&mut app, &ctx, pressed(Key::Escape, Modifiers::NONE));
+        assert!(!app.mini);
+        keys(&mut app, &ctx, ctrl(Key::M));
+        keys(&mut app, &ctx, ctrl(Key::F));
+        assert!(!app.mini);
+    }
+
+    #[test]
+    fn mini_needs_a_login_first() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.need_login = true;
+        keys(&mut app, &ctx, ctrl(Key::M));
+        assert!(!app.mini);
     }
 
     /// Regression: Ctrl+F used to deadlock egui's context and freeze the app.

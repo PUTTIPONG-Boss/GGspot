@@ -2,6 +2,7 @@
 
 mod backend;
 mod cover;
+mod disc;
 mod model;
 mod order;
 mod queue;
@@ -23,8 +24,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(concat!("GGspot v", env!("CARGO_PKG_VERSION")))
-            .with_inner_size([880.0, 580.0])
-            .with_min_inner_size([520.0, 320.0])
+            .with_inner_size(ui::FULL_SIZE)
+            .with_min_inner_size(ui::FULL_MIN)
             .with_icon(egui::IconData {
                 rgba: include_bytes!("../assets/icon64.rgba").to_vec(),
                 width: 64,

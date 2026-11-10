@@ -6,6 +6,10 @@ Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/
 
 ![GGspot showing liked songs, the playlist sidebar and the player bar](assets/screenshot.png)
 
+Press `Ctrl+M` for mini mode: a spinning record over the cover in coloured ASCII.
+
+![GGspot in mini mode, a spinning record over the album cover drawn in ASCII](assets/mini.png)
+
 ## Why it's fast
 
 - **Instant start.** The library is cached on disk, so it shows up on the first frame (about 100 ms). It refreshes in the background.
@@ -24,12 +28,13 @@ Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/
 |---|---|
 | `Space` | play / pause |
 | `Ctrl+F` | search |
-| `Esc` / `Backspace` | clear search / back from artist page |
+| `Esc` / `Backspace` | clear search / back from artist page / leave mini mode |
 | `Ctrl+Left` / `Ctrl+Right` | previous / next |
 | `Ctrl+S` | shuffle on / off |
 | `Ctrl+R` | repeat: off, all, one |
 | `Ctrl+O` | sort playlists: recent, custom, a-z |
 | `Ctrl+I` | album cover on / off |
+| `Ctrl+M` | mini mode: a spinning record over the cover in ASCII |
 | `Alt+Up` / `Alt+Down` | move the open playlist (saves as your custom order) |
 | `Up` / `Down`, `Enter` | select, play |
 
