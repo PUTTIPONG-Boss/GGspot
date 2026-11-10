@@ -27,8 +27,9 @@ Press `Ctrl+M` for mini mode: a spinning record over the cover in coloured ASCII
 | Key | Action |
 |---|---|
 | `Space` | play / pause |
-| `Ctrl+F` | search |
-| `Esc` / `Backspace` | clear search / back from artist page / leave mini mode |
+| `Ctrl+G` | command line: type `/` to see every command |
+| `Ctrl+F` | command line with `/srh` already typed |
+| `Esc` / `Backspace` | clear the command line / back from artist page / leave mini mode |
 | `Ctrl+Left` / `Ctrl+Right` | previous / next |
 | `Ctrl+S` | shuffle on / off |
 | `Ctrl+R` | repeat: off, all, one |
@@ -37,6 +38,22 @@ Press `Ctrl+M` for mini mode: a spinning record over the cover in coloured ASCII
 | `Ctrl+M` | mini mode: a spinning record over the cover in ASCII |
 | `Alt+Up` / `Alt+Down` | move the open playlist (saves as your custom order) |
 | `Up` / `Down`, `Enter` | select, play |
+
+## Commands
+
+Press `Ctrl+G` and type `/`. Suggestions appear as you type: `Up` / `Down` to choose, `Tab` to complete, `Enter` to run.
+
+| Command | Action |
+|---|---|
+| `/srh <song or artist>` | search your library and Spotify |
+| `/play [song]` | play the top match, or resume |
+| `/pause`, `/next`, `/prev` | playback |
+| `/shuf`, `/rpt`, `/auto`, `/art` | same as the buttons |
+| `/vol <0-100>` | set the volume |
+| `/mini` | spinning record mode |
+| `/liked`, `/queue`, `/open <playlist>` | go somewhere |
+| `/sort` | sort playlists: recent, custom, a-z |
+| `/help`, `/quit` | list everything, close GGspot |
 
 `ggspot.exe --offline` browses the cached library without touching the network.
 

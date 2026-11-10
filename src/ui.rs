@@ -11,6 +11,7 @@ use eframe::egui::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{Cmd, Ev};
+use crate::command::{self, Action, Suggestion};
 use crate::cover;
 use crate::disc;
 use crate::model::*;
@@ -29,6 +30,23 @@ const MINI_MIN: [f32; 2] = [310.0, 340.0];
 const ASCII_FONT: f32 = 12.0;
 const ASCII_LINE: f32 = 14.0;
 const TITLE_H: f32 = 22.0;
+const POPUP_ROWS: usize = 10;
+const POPUP_ROW_H: f32 = 22.0;
+/// Shown under /help, beside the commands.
+const KEYS: &[(&str, &str)] = &[
+    ("ctrl+g", "command line"),
+    ("ctrl+f", "command line, ready to search"),
+    ("space", "play / pause"),
+    ("ctrl+left / right", "previous / next"),
+    ("ctrl+s", "shuffle"),
+    ("ctrl+r", "repeat"),
+    ("ctrl+o", "sort playlists"),
+    ("alt+up / down", "move the open playlist"),
+    ("ctrl+i", "album cover"),
+    ("ctrl+m", "mini mode"),
+    ("up / down, enter", "select a song, play it"),
+    ("esc", "clear the command line, go back"),
+];
 /// Pointing at a song this long shows its cover. Passing over one fetches nothing.
 const HOVER_DELAY: Duration = Duration::from_millis(250);
 const HOVER_COLS: usize = 44;
@@ -244,8 +262,8 @@ fn is_maximized(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().maximized.unwrap_or(false))
 }
 
-fn search_id() -> egui::Id {
-    egui::Id::unique("search")
+fn command_id() -> egui::Id {
+    egui::Id::unique("command")
 }
 
 /// The cover popup for the song under the pointer.
@@ -291,6 +309,15 @@ struct ArtistPage {
 pub struct App {
     lib: Library,
     view: String,
+    /// The command line as typed.
+    command: String,
+    cmd_sel: usize,
+    /// So clicking a suggestion isn't lost when the line loses focus.
+    cmd_popup: Rect,
+    show_help: bool,
+    /// Waiting for search results to play the top one.
+    pending_play: Option<String>,
+    /// What `command` is searching for; empty when it isn't.
     query: String,
     query_edited: Option<Instant>,
     sent_query: String,
@@ -344,6 +371,11 @@ impl App {
         Self {
             view: cfg.last_view.clone().filter(|v| v != ARTIST_VIEW).unwrap_or_else(|| LIKED.into()),
             lib,
+            command: String::new(),
+            cmd_sel: 0,
+            cmd_popup: Rect::NOTHING,
+            show_help: false,
+            pending_play: None,
             query: String::new(),
             query_edited: None,
             sent_query: String::new(),
@@ -395,7 +427,7 @@ impl App {
     fn open(&mut self, id: String) {
         self.view = id.clone();
         self.selected = None;
-        self.query.clear();
+        self.clear_command();
         if id == QUEUE_VIEW {
             return;
         }
@@ -417,7 +449,7 @@ impl App {
         self.artist = Some(ArtistPage { uri: uri.clone(), name: name.clone(), tracks: Vec::new(), back_to });
         self.view = ARTIST_VIEW.into();
         self.selected = None;
-        self.query.clear();
+        self.clear_command();
         self.loading = Some(ARTIST_VIEW.into());
         self.send(Cmd::Artist(uri));
     }
@@ -466,6 +498,252 @@ impl App {
             self.scroll_sidebar = true;
             self.send(Cmd::SaveOrder(self.order.clone()));
         }
+    }
+
+    fn clear_command(&mut self) {
+        self.command.clear();
+        self.cmd_sel = 0;
+        self.query.clear();
+        self.query_edited = None;
+        self.show_help = false;
+    }
+
+    fn on_command_edited(&mut self, ctx: &egui::Context) {
+        self.cmd_sel = 0;
+        let query = command::live_query(&self.command).unwrap_or("").to_string();
+        if query != self.query {
+            self.query = query;
+            self.show_help = false;
+            self.fonts.scan(ctx, std::iter::once(self.query.as_str()), false);
+            self.query_edited = Some(Instant::now());
+            self.update_local_search();
+        }
+    }
+
+    /// Put `text` on the command line, with the cursor after it.
+    fn fill_command(&mut self, ctx: &egui::Context, text: String) {
+        let end = text.chars().count();
+        self.command = text;
+        self.on_command_edited(ctx);
+        let id = command_id();
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
+        state.store(ctx, id);
+        ctx.memory_mut(|m| m.request_focus(id));
+        ctx.request_repaint();
+    }
+
+    fn suggestions(&self) -> Vec<Suggestion> {
+        let names: Vec<&str> = self.order.sorted(&self.lib.playlists).iter().map(|p| p.name.as_str()).collect();
+        command::suggest(&self.command, &names)
+    }
+
+    /// Enter: complete what still needs typing, otherwise run the line.
+    fn submit_command(&mut self, ctx: &egui::Context) {
+        let items = self.suggestions();
+        match items.get(self.cmd_sel.min(items.len().saturating_sub(1))) {
+            Some(s) if s.wants_more => self.fill_command(ctx, s.fill.clone()),
+            Some(s) => self.run_command(ctx, s.fill.clone()),
+            None if self.command.trim().is_empty() => {}
+            None => self.run_command(ctx, self.command.clone()),
+        }
+    }
+
+    fn run_command(&mut self, ctx: &egui::Context, line: String) {
+        let action = command::parse(&line);
+        // A search stays on the line so its results stay on screen.
+        if !matches!(action, Ok(Action::Search(_))) {
+            self.clear_command();
+        }
+        match action {
+            Ok(a) => self.apply(ctx, a),
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::Help => self.show_help = true,
+            Action::Search(_) => {}
+            Action::Play(Some(q)) => self.play_search(q),
+            Action::Play(None) if !self.playing => self.send(Cmd::Toggle),
+            Action::Play(None) => {}
+            Action::Pause if self.playing => self.send(Cmd::Toggle),
+            Action::Pause => {}
+            Action::Next => self.send(Cmd::Next),
+            Action::Prev => self.send(Cmd::Prev),
+            Action::Shuffle => self.send(Cmd::ToggleShuffle),
+            Action::Repeat => self.send(Cmd::CycleRepeat),
+            Action::Autoplay => self.send(Cmd::ToggleAutoplay),
+            Action::Art => self.toggle_cover(),
+            Action::Volume(v) => {
+                self.volume = v as f32 / 100.0;
+                self.send(Cmd::Volume((self.volume * 65535.0) as u16));
+            }
+            Action::Mini => self.set_mini(ctx, true),
+            Action::Liked => self.open_view(LIKED.into()),
+            Action::Queue => self.open_view(QUEUE_VIEW.into()),
+            Action::Open(name) => match self.find_playlist(&name) {
+                Some(id) => self.open_view(id),
+                None => self.status = format!("no playlist called: {name}"),
+            },
+            Action::Sort => self.cycle_sort(),
+            Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    fn open_view(&mut self, id: String) {
+        self.artist = None;
+        self.open(id);
+    }
+
+    fn find_playlist(&self, name: &str) -> Option<String> {
+        let name = name.to_lowercase();
+        let sorted = self.order.sorted(&self.lib.playlists);
+        let lower = |p: &&&Playlist| p.name.to_lowercase();
+        sorted
+            .iter()
+            .find(|p| lower(p) == name)
+            .or_else(|| sorted.iter().find(|p| lower(p).contains(&name)))
+            .map(|p| p.id.clone())
+    }
+
+    /// The line was cleared just now, but its last results are still kept if they match.
+    fn play_search(&mut self, q: String) {
+        if self.remote.0 == q && !self.remote.1.is_empty() {
+            let found = self.remote.1.clone();
+            self.play_top(&q, &found);
+        } else {
+            self.status = format!("searching: {q}");
+            self.sent_query = q.clone();
+            self.pending_play = Some(q.clone());
+            self.send(Cmd::Search(q));
+        }
+    }
+
+    fn play_top(&mut self, q: &str, found: &[Track]) {
+        match found.first() {
+            Some(t) => {
+                self.status.clear();
+                self.send(Cmd::Play(vec![t.clone()], 0));
+            }
+            None => self.status = format!("no song found: {q}"),
+        }
+    }
+
+    fn command_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("ggspot:~$").color(ACCENT));
+            let id = command_id();
+            let focused = ctx.memory(|m| m.has_focus(id));
+            if focused {
+                // Before the text box, so these keys choose instead of moving its cursor.
+                let (up, down, tab) = ctx.input_mut(|i| {
+                    (
+                        i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                        i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                        i.consume_key(Modifiers::NONE, Key::Tab),
+                    )
+                });
+                let items = self.suggestions();
+                if !items.is_empty() {
+                    let n = items.len();
+                    let sel = self.cmd_sel.min(n - 1);
+                    self.cmd_sel = if up { (sel + n - 1) % n } else if down { (sel + 1) % n } else { sel };
+                    if tab {
+                        self.fill_command(&ctx, items[self.cmd_sel].fill.clone());
+                    }
+                }
+            }
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.command)
+                    .id(id)
+                    .frame(egui::Frame::NONE)
+                    .lock_focus(true)
+                    .hint_text(RichText::new("type / for commands  (ctrl+g)").color(DIM))
+                    .desired_width((ui.available_width() - 260.0).max(160.0)),
+            );
+            if r.changed() {
+                self.on_command_edited(&ctx);
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                self.submit_command(&ctx);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(&self.status).color(DIM)).truncate());
+            });
+            let over_popup = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| self.cmd_popup.contains(p));
+            let focused = ctx.memory(|m| m.has_focus(id));
+            let items = if focused || over_popup { self.suggestions() } else { Vec::new() };
+            self.command_popup(&ctx, r.rect, &items);
+        });
+    }
+
+    /// Suggestions under the prompt, scrolled so the chosen one is always visible.
+    fn command_popup(&mut self, ctx: &egui::Context, below: Rect, items: &[Suggestion]) {
+        if items.is_empty() {
+            self.cmd_popup = Rect::NOTHING;
+            return;
+        }
+        let sel = self.cmd_sel.min(items.len() - 1);
+        let first = sel.saturating_sub(POPUP_ROWS - 1);
+        let width = (ctx.content_rect().right() - below.left() - 24.0).clamp(240.0, 560.0);
+        let font = FontId::monospace(14.0);
+        let mut clicked = None;
+        let area = egui::Area::new(egui::Id::unique("command_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(below.left(), below.bottom() + 6.0))
+            .fade_in(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.fill(BG_INPUT).stroke(Stroke::new(1.0, BORDER)).inner_margin(4).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (i, s) in items.iter().enumerate().skip(first).take(POPUP_ROWS) {
+                        let (rect, r) = ui.allocate_exact_size(vec2(width, POPUP_ROW_H), Sense::click());
+                        let chosen = i == sel;
+                        ui.painter().rect_filled(rect, 0.0, if chosen { SELECT } else if r.hovered() { HOVER } else { Color32::TRANSPARENT });
+                        let label = Rect::from_x_y_ranges(rect.left() + 6.0..=rect.left() + 196.0, rect.y_range());
+                        let about = Rect::from_x_y_ranges(rect.left() + 204.0..=rect.right() - 6.0, rect.y_range());
+                        let color = if chosen { ACCENT } else { FG };
+                        ui.painter().with_clip_rect(label).text(label.left_center(), Align2::LEFT_CENTER, &s.label, font.clone(), color);
+                        ui.painter().with_clip_rect(about).text(about.left_center(), Align2::LEFT_CENTER, &s.about, font.clone(), DIM);
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if r.clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                    let tip = format!("{}/{}  tab complete  enter run  esc cancel", sel + 1, items.len());
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(tip).size(12.0).color(DIM));
+                });
+            });
+        self.cmd_popup = area.response.rect;
+        if let Some(i) = clicked {
+            let fill = items[i].fill.clone();
+            if fill.ends_with(' ') {
+                self.fill_command(ctx, fill);
+            } else {
+                self.run_command(ctx, fill);
+            }
+        }
+    }
+
+    fn help_view(&self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("# help").heading().color(ACCENT));
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(RichText::new("## commands  (ctrl+g, then type /)").color(DIM));
+            for c in command::COMMANDS {
+                ui.label(RichText::new(format!("{:<26}{}", c.usage(), c.about)).color(FG));
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("## keys").color(DIM));
+            for (key, about) in KEYS {
+                ui.label(RichText::new(format!("{key:<26}{about}")).color(FG));
+            }
+        });
     }
 
     fn toggle_cover(&mut self) {
@@ -736,6 +1014,10 @@ impl App {
                 Ev::Loading(id) => self.loading = Some(id),
                 Ev::SearchResults(q, r) => {
                     self.fonts.scan(ctx, track_texts(&r), false);
+                    if self.pending_play.as_deref() == Some(q.as_str()) {
+                        self.pending_play = None;
+                        self.play_top(&q, &r);
+                    }
                     self.remote = (q, r);
                 }
                 Ev::Artist(uri, r) => {
@@ -905,13 +1187,19 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        // Keys: Space play/pause, Ctrl+F search, Esc clear/back, Ctrl+Left/Right prev/next,
+        // Keys: Space play/pause, Ctrl+G command line, Esc clear/back, Ctrl+Left/Right prev/next,
         // Up/Down + Enter play.
+        // Before anything reads the focus: egui drops focus on Esc as the frame starts.
+        let clearing = !self.mini && (!self.command.is_empty() || self.show_help);
+        if clearing && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.clear_command();
+            ctx.memory_mut(|m| m.surrender_focus(command_id()));
+        }
         let typing = ctx.memory(|m| m.focused().is_some());
-        let search_id = search_id();
         let mut go_back = false;
         // `input_mut` holds egui's context lock: touching `ctx` inside it deadlocks.
-        let focus_search = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F));
+        let (focus_search, focus_command) =
+            ctx.input_mut(|i| (i.consume_key(Modifiers::COMMAND, Key::F), i.consume_key(Modifiers::COMMAND, Key::G)));
         let (move_up, move_down, cycle_sort, toggle_cover, toggle_mini) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::ALT, Key::ArrowUp),
@@ -938,7 +1226,12 @@ impl App {
         }
         if focus_search {
             self.set_mini(ctx, false);
-            ctx.memory_mut(|m| m.request_focus(search_id));
+            let line = if command::live_query(&self.command).is_some() { self.command.clone() } else { "/srh ".to_string() };
+            self.fill_command(ctx, line);
+        }
+        if focus_command {
+            self.set_mini(ctx, false);
+            ctx.memory_mut(|m| m.request_focus(command_id()));
         }
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::COMMAND, Key::ArrowRight) {
@@ -1122,30 +1415,7 @@ impl eframe::App for App {
             return;
         }
         let line = egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(10, 6));
-        egui::Panel::top("top").frame(line.stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("ggspot:~$").color(ACCENT));
-                ui.label(RichText::new("search").color(DIM));
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .id(search_id())
-                        .frame(egui::Frame::NONE)
-                        .hint_text(RichText::new("type a song or artist...  (ctrl+f)").color(DIM))
-                        .desired_width((ui.available_width() - 260.0).max(160.0)),
-                );
-                if r.changed() {
-                    self.fonts.scan(&ctx, std::iter::once(self.query.as_str()), false);
-                    self.query_edited = Some(Instant::now());
-                    self.update_local_search();
-                }
-                if r.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
-                    self.query.clear();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(RichText::new(&self.status).color(DIM)).truncate());
-                });
-            });
-        });
+        egui::Panel::top("top").frame(line.stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| self.command_bar(ui));
 
         egui::Panel::bottom("player").frame(line.stroke(Stroke::new(1.0, BORDER))).show(ui, |ui| self.player_bar(ui));
 
@@ -1216,6 +1486,8 @@ impl eframe::App for App {
         egui::CentralPanel::default_margins().frame(line).show(ui, |ui| {
             if self.need_login {
                 self.login_screen(ui);
+            } else if self.show_help {
+                self.help_view(ui);
             } else if !self.query.trim().is_empty() {
                 let local = self.local_hits.clone();
                 ui.label(RichText::new(format!("-- in your library ({}) --", local.len())).color(DIM));
@@ -1401,6 +1673,123 @@ mod tests {
         assert!(app.hover.is_none());
     }
 
+    fn text(s: &str) -> egui::RawInput {
+        egui::RawInput { events: vec![egui::Event::Text(s.into())], ..Default::default() }
+    }
+
+    fn line(app: &mut App, ctx: &egui::Context, input: egui::RawInput) {
+        let mut output = ctx.run_ui(input, |ui| {
+            app.handle_keys(ui.ctx());
+            app.command_bar(ui);
+        });
+        output.textures_delta.clear();
+    }
+
+    fn press(app: &mut App, ctx: &egui::Context, key: Key) {
+        line(app, ctx, pressed(key, Modifiers::NONE));
+    }
+
+    /// Ctrl+G, then type `s`.
+    fn type_line(app: &mut App, ctx: &egui::Context, s: &str) {
+        line(app, ctx, ctrl(Key::G));
+        line(app, ctx, text(s));
+    }
+
+    #[test]
+    fn tab_completes_and_enter_runs() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        type_line(&mut app, &ctx, "/mi");
+        press(&mut app, &ctx, Key::Tab);
+        assert_eq!(app.command, "/mini");
+        press(&mut app, &ctx, Key::Enter);
+        assert!(app.mini, "/mini ran");
+        assert_eq!(app.command, "");
+    }
+
+    #[test]
+    fn enter_on_part_of_a_word_runs_or_waits_for_the_argument() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        type_line(&mut app, &ctx, "/hel");
+        press(&mut app, &ctx, Key::Enter);
+        assert!(app.show_help);
+        press(&mut app, &ctx, Key::Escape);
+        assert!(!app.show_help);
+
+        type_line(&mut app, &ctx, "/sr");
+        press(&mut app, &ctx, Key::Enter);
+        assert_eq!(app.command, "/srh ");
+    }
+
+    #[test]
+    fn arrows_choose_a_suggestion() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        type_line(&mut app, &ctx, "/");
+        press(&mut app, &ctx, Key::ArrowDown);
+        press(&mut app, &ctx, Key::Tab);
+        assert_eq!(app.command, "/srh ");
+    }
+
+    #[test]
+    fn srh_searches_while_typing_and_esc_clears_it() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        type_line(&mut app, &ctx, "/srh king");
+        assert_eq!(app.query, "king");
+        press(&mut app, &ctx, Key::Enter);
+        assert_eq!(app.query, "king", "results stay after enter");
+        press(&mut app, &ctx, Key::Escape);
+        assert_eq!((app.command.as_str(), app.query.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn play_searches_then_plays_the_top_match() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Library::default(), &Config::default(), cmd_tx, ev_rx);
+        let ctx = egui::Context::default();
+        type_line(&mut app, &ctx, "/play aizo");
+        press(&mut app, &ctx, Key::Enter);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::Search(q)) if q == "aizo"));
+        assert_eq!(app.command, "");
+
+        let song = |uri: &str| Track {
+            uri: uri.into(),
+            name: uri.into(),
+            artists: String::new(),
+            album: String::new(),
+            ms: 1,
+            artist_uris: Vec::new(),
+        };
+        ev_tx.send(Ev::SearchResults("older".into(), vec![song("wrong")])).unwrap();
+        app.drain_events(&ctx);
+        assert!(cmd_rx.try_recv().is_err(), "another search's results don't play");
+        ev_tx.send(Ev::SearchResults("aizo".into(), vec![song("top"), song("second")])).unwrap();
+        app.drain_events(&ctx);
+        assert!(matches!(cmd_rx.try_recv(), Ok(Cmd::Play(t, 0)) if t.len() == 1 && t[0].uri == "top"));
+    }
+
+    #[test]
+    fn plain_text_is_not_a_command() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        type_line(&mut app, &ctx, "hello");
+        press(&mut app, &ctx, Key::Enter);
+        assert!(app.status.contains("/help"), "{}", app.status);
+        assert_eq!(app.command, "");
+    }
+
+    #[test]
+    fn ctrl_f_starts_a_search() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        line(&mut app, &ctx, ctrl(Key::F));
+        line(&mut app, &ctx, text("aizo"));
+        assert_eq!(app.command, "/srh aizo");
+    }
+
     /// One frame of the window frame's code at the default size; returns what it asked Windows to do.
     fn frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<egui::ViewportCommand> {
         let input = egui::RawInput {
@@ -1508,7 +1897,7 @@ mod tests {
             let mut focused = false;
             let mut output = ctx.run_ui(input, |ui| {
                 app.handle_keys(ui.ctx());
-                focused = ui.ctx().memory(|m| m.has_focus(search_id()));
+                focused = ui.ctx().memory(|m| m.has_focus(command_id()));
             });
             output.textures_delta.clear();
             let _ = done_tx.send(focused);
