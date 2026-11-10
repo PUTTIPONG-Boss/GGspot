@@ -25,7 +25,7 @@ const QUEUE_VIEW: &str = "queue";
 pub const FULL_SIZE: [f32; 2] = [880.0, 580.0];
 pub const FULL_MIN: [f32; 2] = [520.0, 320.0];
 const MINI_SIZE: [f32; 2] = [340.0, 460.0];
-const MINI_MIN: [f32; 2] = [280.0, 340.0];
+const MINI_MIN: [f32; 2] = [310.0, 340.0];
 const ASCII_FONT: f32 = 12.0;
 const ASCII_LINE: f32 = 14.0;
 
@@ -527,6 +527,11 @@ impl App {
                     let ctx = ui.ctx().clone();
                     self.set_mini(&ctx, false);
                 }
+                // Laid out right to left: whatever room is left, less "vol" and the brackets.
+                let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&FontId::monospace(14.0), '='));
+                let chars = ((ui.available_width() - 33.0) / cw - 2.0).clamp(4.0, 12.0) as usize;
+                self.volume_bar(ui, chars);
+                ui.label(RichText::new("vol").color(DIM));
             });
         });
     }
@@ -821,6 +826,13 @@ impl App {
         }
     }
 
+    fn volume_bar(&mut self, ui: &mut egui::Ui, chars: usize) {
+        if let Some(v) = ascii_bar(ui, "volume", self.volume, chars) {
+            self.volume = v;
+            self.send(Cmd::Volume((v * 65535.0) as u16));
+        }
+    }
+
     fn transport(&self, ui: &mut egui::Ui) {
         if text_button(ui, "[|<]") {
             self.send(Cmd::Prev);
@@ -911,10 +923,7 @@ impl App {
             self.progress_row(ui, 260.0);
             ui.add_space(16.0);
             ui.label(RichText::new("vol").color(DIM));
-            if let Some(v) = ascii_bar(ui, "volume", self.volume, 10) {
-                self.volume = v;
-                self.send(Cmd::Volume((v * 65535.0) as u16));
-            }
+            self.volume_bar(ui, 10);
         });
         ui.add_space(2.0);
         if let Some(t) = open_artist {
