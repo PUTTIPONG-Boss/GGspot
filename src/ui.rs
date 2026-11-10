@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{Cmd, Ev};
 use crate::model::*;
+use crate::order::{PlaylistOrder, SortMode};
 use crate::queue::Repeat;
 
 const ROW_H: f32 = 24.0;
@@ -237,6 +238,8 @@ pub struct App {
     repeat: Repeat,
     shuffle: bool,
     autoplay: bool,
+    order: PlaylistOrder,
+    scroll_sidebar: bool,
     playing: bool,
     pos: (u32, Instant),
     seek: Option<f32>,
@@ -271,6 +274,8 @@ impl App {
             repeat: cfg.repeat,
             shuffle: cfg.shuffle,
             autoplay: cfg.autoplay.unwrap_or(true),
+            order: cfg.order.clone(),
+            scroll_sidebar: false,
             playing: false,
             pos: (0, Instant::now()),
             seek: None,
@@ -340,12 +345,37 @@ impl App {
     }
 
     /// Play row `i` of the main list; in the queue view that moves within the queue.
-    fn play_main(&self, i: usize) {
+    fn play_main(&mut self, i: usize) {
         if self.view == QUEUE_VIEW {
             self.send(Cmd::Jump(self.queue_idx + i));
         } else {
             self.send(Cmd::Play(self.current_tracks().to_vec(), i));
+            self.mark_view_played();
         }
+    }
+
+    /// Playing from a playlist lifts it to the top of the "recent" order.
+    fn mark_view_played(&mut self) {
+        if self.lib.playlists.iter().any(|p| p.id == self.view) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            self.order.mark_played(&self.view, now);
+            self.send(Cmd::SaveOrder(self.order.clone()));
+        }
+    }
+
+    fn move_open_playlist(&mut self, delta: isize) {
+        if self.query.is_empty() && self.order.move_by(&self.lib.playlists, &self.view, delta) {
+            self.scroll_sidebar = true;
+            self.send(Cmd::SaveOrder(self.order.clone()));
+        }
+    }
+
+    fn cycle_sort(&mut self) {
+        self.order.mode = self.order.mode.cycled();
+        self.scroll_sidebar = true;
+        self.send(Cmd::SaveOrder(self.order.clone()));
     }
 
     fn position(&self) -> u32 {
@@ -541,6 +571,22 @@ impl App {
         let mut go_back = false;
         // `input_mut` holds egui's context lock: touching `ctx` inside it deadlocks.
         let focus_search = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F));
+        let (move_up, move_down, cycle_sort) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::ALT, Key::ArrowUp),
+                i.consume_key(Modifiers::ALT, Key::ArrowDown),
+                i.consume_key(Modifiers::COMMAND, Key::O),
+            )
+        });
+        if move_up {
+            self.move_open_playlist(-1);
+        }
+        if move_down {
+            self.move_open_playlist(1);
+        }
+        if cycle_sort {
+            self.cycle_sort();
+        }
         if focus_search {
             ctx.memory_mut(|m| m.request_focus(search_id));
         }
@@ -723,6 +769,7 @@ impl eframe::App for App {
                         ui.label(RichText::new("## library").color(DIM));
                         let mut open = None;
                         let in_list = self.query.is_empty() && self.view != ARTIST_VIEW;
+                        let scroll = std::mem::take(&mut self.scroll_sidebar);
                         let mut entry = |ui: &mut egui::Ui, id: &str, name: &str| {
                             let on = in_list && self.view == id;
                             let text = RichText::new(format!("{} {name}", if on { ">" } else { " " }))
@@ -734,17 +781,37 @@ impl eframe::App for App {
                             if r.clicked() {
                                 open = Some(id.to_string());
                             }
+                            if on && scroll {
+                                r.scroll_to_me(None);
+                            }
                         };
                         entry(ui, LIKED, "liked songs");
                         entry(ui, QUEUE_VIEW, "queue");
                         ui.add_space(6.0);
-                        ui.label(RichText::new("## playlists").color(DIM));
-                        for p in &self.lib.playlists {
+                        let mut cycle = false;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("## playlists").color(DIM));
+                            let label = match self.order.mode {
+                                SortMode::Recent => "[recent]",
+                                SortMode::Custom => "[custom]",
+                                SortMode::Alpha => "[a-z]",
+                            };
+                            cycle = mode_button(
+                                ui,
+                                label,
+                                true,
+                                "sort: recent, custom, a-z (ctrl+o)\nalt+up / alt+down moves the open playlist",
+                            );
+                        });
+                        for p in self.order.sorted(&self.lib.playlists) {
                             entry(ui, &p.id, &p.name);
                         }
                         if let Some(id) = open {
                             self.artist = None;
                             self.open(id);
+                        }
+                        if cycle {
+                            self.cycle_sort();
                         }
                     });
                 });
@@ -822,6 +889,44 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pressed(key: Key, modifiers: Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+            ..Default::default()
+        }
+    }
+
+    fn playlist(id: &str) -> Playlist {
+        Playlist { id: id.into(), name: id.into(), snapshot: String::new() }
+    }
+
+    #[test]
+    fn alt_arrows_move_the_open_playlist_and_not_the_song_selection() {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_ev_tx, ev_rx) = std::sync::mpsc::channel();
+        let track = Track {
+            uri: "spotify:track:1".into(),
+            name: "x".into(),
+            artists: String::new(),
+            album: String::new(),
+            ms: 1,
+            artist_uris: Vec::new(),
+        };
+        let lib = Library {
+            playlists: vec![playlist("a"), playlist("b")],
+            contents: [("a".to_string(), (String::new(), vec![track.clone(), track]))].into(),
+            ..Default::default()
+        };
+        let mut app = App::new(lib, &Config { last_view: Some("a".into()), ..Default::default() }, cmd_tx, ev_rx);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(pressed(Key::ArrowDown, Modifiers::ALT), |ui| app.handle_keys(ui.ctx()));
+        output.textures_delta.clear();
+        let order: Vec<&str> = app.order.sorted(&app.lib.playlists).iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(order, ["b", "a"]);
+        assert_eq!(app.order.mode, SortMode::Custom);
+        assert_eq!(app.selected, None);
+    }
 
     /// Regression: Ctrl+F used to deadlock egui's context and freeze the app.
     #[test]

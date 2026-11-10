@@ -28,6 +28,8 @@ Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/
 | `Ctrl+Left` / `Ctrl+Right` | previous / next |
 | `Ctrl+S` | shuffle on / off |
 | `Ctrl+R` | repeat: off, all, one |
+| `Ctrl+O` | sort playlists: recent, custom, a-z |
+| `Alt+Up` / `Alt+Down` | move the open playlist (saves as your custom order) |
 | `Up` / `Down`, `Enter` | select, play |
 
 `ggspot.exe --offline` browses the cached library without touching the network.

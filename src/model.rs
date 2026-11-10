@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::order::PlaylistOrder;
 use crate::queue::Repeat;
 
 pub const LIKED: &str = "liked";
@@ -45,6 +46,8 @@ pub struct Config {
     pub shuffle: bool,
     /// On unless turned off, like Spotify.
     pub autoplay: Option<bool>,
+    #[serde(default)]
+    pub order: PlaylistOrder,
 }
 
 pub fn data_dir() -> PathBuf {

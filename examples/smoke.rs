@@ -9,6 +9,9 @@ mod backend;
 #[path = "../src/model.rs"]
 #[allow(dead_code)]
 mod model;
+#[path = "../src/order.rs"]
+#[allow(dead_code)]
+mod order;
 #[path = "../src/queue.rs"]
 #[allow(dead_code)]
 mod queue;

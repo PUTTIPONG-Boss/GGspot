@@ -2,6 +2,7 @@
 
 mod backend;
 mod model;
+mod order;
 mod queue;
 #[cfg(windows)]
 mod win_icon;

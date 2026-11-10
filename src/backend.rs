@@ -34,6 +34,7 @@ use protobuf::{EnumOrUnknown, Message};
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::model::*;
+use crate::order::PlaylistOrder;
 use crate::queue::{Queue, Repeat};
 
 /// Spotify's desktop client ID: its login page is the regular Spotify one.
@@ -66,6 +67,7 @@ pub enum Cmd {
     Seek(u32),
     Volume(u16),
     View(String),
+    SaveOrder(PlaylistOrder),
 }
 
 pub enum Ev {
@@ -856,6 +858,7 @@ async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
                     cfg.volume = Some(v); cfg.save();
                 }
                 Cmd::View(v) => { cfg.last_view = Some(v); cfg.save(); }
+                Cmd::SaveOrder(o) => { cfg.order = o; cfg.save(); }
             },
             else => break,
         }
