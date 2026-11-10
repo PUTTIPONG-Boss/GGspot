@@ -1,6 +1,6 @@
 # GGspot
 
-A tiny, terminal-style Spotify player for Windows. It's for listening and nothing else: search, playlists, liked songs, artist pages, shuffle, repeat and autoplay. No home feed, no cover art, no browser engine.
+A tiny, terminal-style Spotify player for Windows. It's for listening and nothing else: search, playlists, liked songs, artist pages, shuffle, repeat and autoplay. Covers are drawn as chunky colour blocks. No home feed, no browser engine.
 
 Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/librespot-org/librespot). **Playback needs Spotify Premium.**
 
@@ -29,12 +29,13 @@ Built with Rust, [egui](https://www.egui.rs) and [librespot](https://github.com/
 | `Ctrl+S` | shuffle on / off |
 | `Ctrl+R` | repeat: off, all, one |
 | `Ctrl+O` | sort playlists: recent, custom, a-z |
+| `Ctrl+I` | album cover on / off |
 | `Alt+Up` / `Alt+Down` | move the open playlist (saves as your custom order) |
 | `Up` / `Down`, `Enter` | select, play |
 
 `ggspot.exe --offline` browses the cached library without touching the network.
 
-Data lives in `%LOCALAPPDATA%\ggspot`: the library cache, your saved login and a 1 GB audio cache. Delete the `credentials` folder there to log out.
+Data lives in `%LOCALAPPDATA%\ggspot`: the library cache, your saved login and a 1 GB audio cache, and small cover files. Delete the `credentials` folder there to log out.
 
 ## Build
 

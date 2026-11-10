@@ -48,6 +48,8 @@ pub struct Config {
     pub autoplay: Option<bool>,
     #[serde(default)]
     pub order: PlaylistOrder,
+    /// On unless turned off.
+    pub show_cover: Option<bool>,
 }
 
 pub fn data_dir() -> PathBuf {

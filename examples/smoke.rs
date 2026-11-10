@@ -6,6 +6,9 @@
 #[path = "../src/backend.rs"]
 #[allow(dead_code)]
 mod backend;
+#[path = "../src/cover.rs"]
+#[allow(dead_code)]
+mod cover;
 #[path = "../src/model.rs"]
 #[allow(dead_code)]
 mod model;
@@ -90,7 +93,7 @@ fn run(cmd: &UnboundedSender<Cmd>, rx: &Receiver<Ev>, c: &mut Checks) -> Option<
     let t = Instant::now();
     cmd.send(Cmd::Play(vec![seed.clone()], 0)).unwrap();
     // Either can arrive first.
-    let (mut len, mut playing) = (None, false);
+    let (mut len, mut playing, mut art) = (None, false, None);
     wait(rx, 30, |e| {
         match e {
             Ev::Queue { tracks, .. } if tracks.len() > 1 => {
@@ -101,10 +104,15 @@ fn run(cmd: &UnboundedSender<Cmd>, rx: &Receiver<Ev>, c: &mut Checks) -> Option<
                 println!("song started after {} ms", t.elapsed().as_millis());
                 playing = true;
             }
+            Ev::Cover(_, cells) => {
+                println!("cover: {:?} bytes after {} ms", cells.as_ref().map(Vec::len), t.elapsed().as_millis());
+                art = Some(cells);
+            }
             _ => {}
         }
-        (len.is_some() && playing).then_some(())
+        (len.is_some() && playing && art.is_some()).then_some(())
     });
+    c.check("cover art loads", art.flatten().is_some());
     c.check("autoplay extends a one-song queue", len.is_some());
     c.check("song starts playing", playing);
     finish(cmd, &seed);

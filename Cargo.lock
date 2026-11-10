@@ -1529,11 +1529,12 @@ dependencies = [
 
 [[package]]
 name = "ggspot"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dirs",
  "eframe",
  "fastrand",
+ "image",
  "librespot-core",
  "librespot-metadata",
  "librespot-oauth",
@@ -2059,6 +2060,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

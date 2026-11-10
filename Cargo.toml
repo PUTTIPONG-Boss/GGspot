@@ -1,9 +1,10 @@
 [package]
 name = "ggspot"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 dirs = "7.0.0"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit", "clipboard"] }
 fastrand = "2.5.0"

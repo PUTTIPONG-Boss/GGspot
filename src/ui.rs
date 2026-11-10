@@ -11,6 +11,7 @@ use eframe::egui::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::backend::{Cmd, Ev};
+use crate::cover;
 use crate::model::*;
 use crate::order::{PlaylistOrder, SortMode};
 use crate::queue::Repeat;
@@ -240,6 +241,8 @@ pub struct App {
     autoplay: bool,
     order: PlaylistOrder,
     scroll_sidebar: bool,
+    cover: Option<egui::TextureHandle>,
+    show_cover: bool,
     playing: bool,
     pos: (u32, Instant),
     seek: Option<f32>,
@@ -276,6 +279,8 @@ impl App {
             autoplay: cfg.autoplay.unwrap_or(true),
             order: cfg.order.clone(),
             scroll_sidebar: false,
+            cover: None,
+            show_cover: cfg.show_cover.unwrap_or(true),
             playing: false,
             pos: (0, Instant::now()),
             seek: None,
@@ -372,6 +377,29 @@ impl App {
         }
     }
 
+    fn toggle_cover(&mut self) {
+        self.show_cover = !self.show_cover;
+        self.send(Cmd::ShowCover(self.show_cover));
+    }
+
+    /// The cover as big square blocks: a whole number of pixels each, so edges stay crisp.
+    fn cover_view(&self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        let cells = cover::CELLS as f32;
+        let block = (ui.available_width() / cells).floor().clamp(3.0, 8.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(cells * block, cells * block), Sense::hover());
+        match &self.cover {
+            Some(tex) => {
+                let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+            }
+            None => {
+                ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, "-- no cover --", FontId::monospace(12.0), DIM);
+            }
+        }
+    }
+
     fn cycle_sort(&mut self) {
         self.order.mode = self.order.mode.cycled();
         self.scroll_sidebar = true;
@@ -424,6 +452,15 @@ impl App {
                         if self.loading.as_deref() == Some(ARTIST_VIEW) {
                             self.loading = None;
                         }
+                    }
+                }
+                Ev::Cover(uri, cells) => {
+                    if self.now.as_ref().is_some_and(|t| t.uri == uri) {
+                        let side = cover::CELLS as usize;
+                        self.cover = cells.map(|rgb| {
+                            let image = egui::ColorImage::from_rgb([side, side], &rgb);
+                            ctx.load_texture("cover", image, egui::TextureOptions::NEAREST)
+                        });
                     }
                 }
                 Ev::NowPlaying(t) => {
@@ -571,13 +608,17 @@ impl App {
         let mut go_back = false;
         // `input_mut` holds egui's context lock: touching `ctx` inside it deadlocks.
         let focus_search = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F));
-        let (move_up, move_down, cycle_sort) = ctx.input_mut(|i| {
+        let (move_up, move_down, cycle_sort, toggle_cover) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::ALT, Key::ArrowUp),
                 i.consume_key(Modifiers::ALT, Key::ArrowDown),
                 i.consume_key(Modifiers::COMMAND, Key::O),
+                i.consume_key(Modifiers::COMMAND, Key::I),
             )
         });
+        if toggle_cover {
+            self.toggle_cover();
+        }
         if move_up {
             self.move_open_playlist(-1);
         }
@@ -655,6 +696,9 @@ impl App {
             }
             if mode_button(ui, "[auto]", self.autoplay, "autoplay: keep playing similar songs when the queue ends") {
                 self.send(Cmd::ToggleAutoplay);
+            }
+            if mode_button(ui, "[art]", self.show_cover, "album cover (ctrl+i)") {
+                self.toggle_cover();
             }
             ui.add_space(10.0);
             match &self.now {
@@ -765,6 +809,12 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_size(220.0)
                 .show(ui, |ui| {
+                    if self.show_cover && self.now.is_some() {
+                        egui::Panel::bottom("cover")
+                            .frame(egui::Frame::NONE)
+                            .resizable(false)
+                            .show(ui, |ui| self.cover_view(ui));
+                    }
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         ui.label(RichText::new("## library").color(DIM));
                         let mut open = None;

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use librespot_core::{
-    SpotifyId, SpotifyUri, authentication::Credentials, cache::Cache, config::SessionConfig,
+    FileId, SpotifyId, SpotifyUri, authentication::Credentials, cache::Cache, config::SessionConfig,
     session::Session,
 };
 use librespot_metadata::{Metadata, Playlist as SpPlaylist};
@@ -27,12 +27,13 @@ use librespot_protocol::{
     context_page::ContextPage,
     extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery},
     extension_kind::ExtensionKind,
-    metadata::Track as PbTrack,
+    metadata::{Track as PbTrack, image::Size as ImageSize},
     playlist4_external::SelectedListContent,
 };
 use protobuf::{EnumOrUnknown, Message};
 use tokio::sync::{Semaphore, mpsc, watch};
 
+use crate::cover;
 use crate::model::*;
 use crate::order::PlaylistOrder;
 use crate::queue::{Queue, Repeat};
@@ -68,6 +69,7 @@ pub enum Cmd {
     Volume(u16),
     View(String),
     SaveOrder(PlaylistOrder),
+    ShowCover(bool),
 }
 
 pub enum Ev {
@@ -81,6 +83,8 @@ pub enum Ev {
     SearchResults(String, Vec<Track>),
     Artist(String, Vec<Track>),
     NowPlaying(Track),
+    /// Track URI and its cover blocks; `None` if it has no usable cover.
+    Cover(String, Option<Vec<u8>>),
     State { playing: bool, pos_ms: u32 },
     Queue { tracks: Vec<Track>, idx: usize, auto_from: Option<usize> },
     Modes { repeat: Repeat, shuffle: bool, autoplay: bool },
@@ -391,6 +395,25 @@ async fn fetch_autoplay(
     resolve(session, &uris, known).await
 }
 
+/// Cover blocks for a track: from disk if seen before, else from Spotify.
+async fn fetch_cover(session: &Session, track_uri: &str) -> Res<Vec<u8>> {
+    let uri = SpotifyUri::from_uri(track_uri).map_err(err)?;
+    let bytes = session.spclient().get_track_metadata(&uri).await.map_err(err)?;
+    let track = PbTrack::parse_from_bytes(&bytes).map_err(err)?;
+    let images = &track.album.cover_group.image;
+    // The 300 px size: plenty for 40 blocks, and a fraction of the largest one.
+    let image = images
+        .iter()
+        .find(|i| i.size() == ImageSize::DEFAULT)
+        .or_else(|| images.first())
+        .filter(|i| i.file_id().len() == 20)
+        .ok_or("no cover")?;
+    let encoded = session.spclient().get_image(&FileId::from_raw(image.file_id())).await.map_err(err)?;
+    let cells = tokio::task::spawn_blocking(move || cover::to_cells(&encoded)).await.map_err(err)??;
+    cover::save_cached(track_uri, &cells);
+    Ok(cells)
+}
+
 // ------------------------------------------------------------- Main loop
 
 struct Shared {
@@ -515,6 +538,7 @@ struct Playback {
     /// Asked to play before the player exists.
     pending: bool,
     reconnect: bool,
+    cover_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Playback {
@@ -551,10 +575,26 @@ impl Playback {
             }
         }
         self.pos = (0, Instant::now());
+        let uri = t.uri.clone();
         self.out.send(Ev::NowPlaying(t));
+        self.load_cover(uri);
         self.publish_queue();
         self.auto_exhausted = false;
         self.maybe_autoplay();
+    }
+
+    fn load_cover(&mut self, uri: String) {
+        if let Some(task) = self.cover_task.take() {
+            task.abort();
+        }
+        let shared = self.shared.clone();
+        self.cover_task = Some(tokio::spawn(async move {
+            let cells = match cover::load_cached(&uri) {
+                Some(cells) => Some(cells),
+                None => fetch_cover(&shared.session().await, &uri).await.ok(),
+            };
+            shared.out.send(Ev::Cover(uri, cells));
+        }));
     }
 
     fn stop_at_end(&mut self) {
@@ -774,6 +814,7 @@ async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
         failures: 0,
         pending: false,
         reconnect: false,
+        cover_task: None,
     };
     pb.publish_modes();
     let mut events: Option<mpsc::UnboundedReceiver<PlayerEvent>> = None;
@@ -859,6 +900,7 @@ async fn run(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: Out, lib: Library) {
                 }
                 Cmd::View(v) => { cfg.last_view = Some(v); cfg.save(); }
                 Cmd::SaveOrder(o) => { cfg.order = o; cfg.save(); }
+                Cmd::ShowCover(on) => { cfg.show_cover = Some(on); cfg.save(); }
             },
             else => break,
         }
